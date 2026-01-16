@@ -271,19 +271,30 @@ def analyze_logs(line_source, source_name):
         print(f"No bundle activity found in {line_count:,} log lines.")
         sys.exit(0)
 
-    # Print BAM Bundle Activity table
-    print(f"{'BAM BUNDLE ACTIVITY':=^95}")
-    print(f"{'Time (UTC)':<20} | {'Slot Range':<25} | {'Bundles':>10} | {'Results Sent':>12} | {'% Sent':>8}")
-    print("-" * 95)
+    # Outlier threshold (20% above/below average)
+    OUTLIER_PCT = 0.20
+    UP_ARROW = "▲"
+    DOWN_ARROW = "▼"
 
-    # Totals for summary
+    def get_indicator(value, avg):
+        """Return indicator if value is significantly above/below average"""
+        if avg == 0:
+            return ""
+        pct_diff = (value - avg) / avg
+        if pct_diff > OUTLIER_PCT:
+            return UP_ARROW
+        elif pct_diff < -OUTLIER_PCT:
+            return DOWN_ARROW
+        return ""
+
+    # First pass: collect BAM bundle data for averages
+    bundle_rows = []
     total_bundles = 0
     total_results = 0
     total_scheduler_fail = 0
     total_outbound_fail = 0
     total_unhealthy = 0
     total_heartbeats = 0
-    total_periods = 0
 
     for minute in active_minutes:
         data = bundle_data[minute]
@@ -302,7 +313,13 @@ def analyze_logs(line_source, source_name):
         results = data["results_sent"]
         pct_sent = (results / bundles * 100) if bundles > 0 else 0
 
-        print(f"{minute:<20} | {slot_range:<25} | {bundles:>10,} | {results:>12,} | {pct_sent:>7.1f}%")
+        bundle_rows.append({
+            "minute": minute,
+            "slot_range": slot_range,
+            "bundles": bundles,
+            "results": results,
+            "pct_sent": pct_sent
+        })
 
         total_bundles += bundles
         total_results += results
@@ -310,14 +327,30 @@ def analyze_logs(line_source, source_name):
         total_outbound_fail += data["outbound_fail"]
         total_unhealthy += data["unhealthy_count"]
         total_heartbeats += data["heartbeat_received"]
-        total_periods += 1
+
+    total_periods = len(bundle_rows)
+    avg_bundles = total_bundles / total_periods if total_periods > 0 else 0
+    avg_results = total_results / total_periods if total_periods > 0 else 0
+
+    # Print BAM Bundle Activity table
+    print(f"{'BAM BUNDLE ACTIVITY':=^99}")
+    print(f"{'Time (UTC)':<20} | {'Slot Range':<25} | {'Bundles':>12} | {'Results Sent':>14} | {'% Sent':>8}")
+    print("-" * 99)
+
+    for row in bundle_rows:
+        b_ind = get_indicator(row["bundles"], avg_bundles)
+        r_ind = get_indicator(row["results"], avg_results)
+        bundles_str = f"{row['bundles']:>10,}{b_ind:>2}"
+        results_str = f"{row['results']:>12,}{r_ind:>2}"
+        print(f"{row['minute']:<20} | {row['slot_range']:<25} | {bundles_str} | {results_str} | {row['pct_sent']:>7.1f}%")
 
     # Print summary
-    print("-" * 95)
+    print("-" * 99)
     periods_str = f"{total_periods} periods"
     total_pct = (total_results / total_bundles * 100) if total_bundles > 0 else 0
-    print(f"{'TOTAL':<20} | {periods_str:<25} | {total_bundles:>10,} | {total_results:>12,} | {total_pct:>7.1f}%")
-    print("=" * 95)
+    print(f"{'TOTAL':<20} | {periods_str:<25} | {total_bundles:>12,} | {total_results:>14,} | {total_pct:>7.1f}%")
+    print(f"{'(average)':<20} | {'':<25} | {avg_bundles:>12,.0f} | {avg_results:>14,.0f} |")
+    print("=" * 99)
 
     # Print failures table if any failures occurred
     total_failures = total_scheduler_fail + total_outbound_fail
@@ -325,9 +358,9 @@ def analyze_logs(line_source, source_name):
         fail_minutes = sorted([m for m, d in bundle_data.items()
                               if d["scheduler_fail"] > 0 or d["outbound_fail"] > 0])
 
-        print(f"\n{'FAILURES DETECTED':=^95}")
-        print(f"{'Time (UTC)':<20} | {'Slot Range':<25} | {'Sched Fail':>10} | {'Outbound Fail':>13} | {'Total':>8}")
-        print("-" * 95)
+        print(f"\n{'FAILURES DETECTED':=^99}")
+        print(f"{'Time (UTC)':<20} | {'Slot Range':<25} | {'Sched Fail':>12} | {'Outbound Fail':>14} | {'Total':>8}")
+        print("-" * 99)
 
         for minute in fail_minutes:
             data = bundle_data[minute]
@@ -342,11 +375,11 @@ def analyze_logs(line_source, source_name):
             out_fail = data["outbound_fail"]
             total_min_fail = sched_fail + out_fail
 
-            print(f"{minute:<20} | {slot_range:<25} | {sched_fail:>10,} | {out_fail:>13,} | {total_min_fail:>8,}")
+            print(f"{minute:<20} | {slot_range:<25} | {sched_fail:>12,} | {out_fail:>14,} | {total_min_fail:>8,}")
 
-        print("-" * 95)
-        print(f"{'TOTAL FAILURES':<20} | {'':<25} | {total_scheduler_fail:>10,} | {total_outbound_fail:>13,} | {total_failures:>8,}")
-        print("=" * 95)
+        print("-" * 99)
+        print(f"{'TOTAL FAILURES':<20} | {'':<25} | {total_scheduler_fail:>12,} | {total_outbound_fail:>14,} | {total_failures:>8,}")
+        print("=" * 99)
 
     # Print Leader Slot Metrics table
     if leader_slot_metrics or leader_slots_announced:
@@ -356,11 +389,8 @@ def analyze_logs(line_source, source_name):
         # Combine all leader slots (produced + skipped) for display
         all_leader_slots = sorted(set(leader_slot_metrics.keys()) | skipped_slots)
 
-        print(f"\n{'LEADER SLOT METRICS':=^144}")
-        print(f"{'Slot':<26} | {'Txns':>6} | {'Votes':>6} | {'User':>6} | {'Block CUs':>12} | {'Time (ms)':>10} | {'Total Fee':>14} | {'Priority Fee':>14}")
-        print("-" * 144)
-
-        # Totals for leader slot summary
+        # First pass: collect data and calculate averages
+        slot_rows = []
         total_txns = 0
         total_votes = 0
         total_user = 0
@@ -373,8 +403,7 @@ def analyze_logs(line_source, source_name):
 
         for slot in all_leader_slots:
             if slot in skipped_slots:
-                # Skipped slot - show with dashes
-                print(f"{slot:<26} | {'---':>6} | {'---':>6} | {'---':>6} | {'---':>12} | {'---':>10} | {'---':>14} | {'SKIPPED':>14}")
+                slot_rows.append({"slot": slot, "skipped": True})
                 skipped_count += 1
             else:
                 m = leader_slot_metrics[slot]
@@ -396,7 +425,17 @@ def analyze_logs(line_source, source_name):
                 slot_time_us = broadcast_time if broadcast_time > 0 else (receive_time + schedule_time)
                 slot_time_ms = slot_time_us / 1000
 
-                print(f"{slot:<26} | {txns:>6,} | {est_votes:>6,} | {est_user:>6,} | {block_cost:>12,} | {slot_time_ms:>10.1f} | {format_lamports(total_fee):>14} | {format_lamports(priority_fee):>14}")
+                slot_rows.append({
+                    "slot": slot,
+                    "skipped": False,
+                    "txns": txns,
+                    "votes": est_votes,
+                    "user": est_user,
+                    "block_cost": block_cost,
+                    "time_ms": slot_time_ms,
+                    "total_fee": total_fee,
+                    "priority_fee": priority_fee
+                })
 
                 total_txns += txns
                 total_votes += est_votes
@@ -407,12 +446,41 @@ def analyze_logs(line_source, source_name):
                 total_priority_fee += priority_fee
                 slot_count += 1
 
-        print("-" * 144)
+        # Calculate averages
+        avg_txns = total_txns / slot_count if slot_count > 0 else 0
+        avg_votes = total_votes / slot_count if slot_count > 0 else 0
+        avg_user = total_user / slot_count if slot_count > 0 else 0
+        avg_block_cost = total_block_cost / slot_count if slot_count > 0 else 0
         avg_time_ms = (total_time_us / slot_count / 1000) if slot_count > 0 else 0
-        print(f"{'TOTAL':<26} | {total_txns:>6,} | {total_votes:>6,} | {total_user:>6,} | {total_block_cost:>12,} | {avg_time_ms:>10.1f} | {format_lamports(total_total_fee):>14} | {format_lamports(total_priority_fee):>14}")
+
+        # Print table with indicators
+        print(f"\n{'LEADER SLOT METRICS':=^156}")
+        print(f"{'Slot':<26} | {'Txns':>8} | {'Votes':>8} | {'User':>8} | {'Block CUs':>15} | {'Time (ms)':>12} | {'Total Fee':>14} | {'Priority Fee':>14}")
+        print("-" * 156)
+
+        for row in slot_rows:
+            if row["skipped"]:
+                print(f"{row['slot']:<26} | {'---':>8} | {'---':>8} | {'---':>8} | {'---':>15} | {'---':>12} | {'---':>14} | {'SKIPPED':>14}")
+            else:
+                t_ind = get_indicator(row["txns"], avg_txns)
+                v_ind = get_indicator(row["votes"], avg_votes)
+                u_ind = get_indicator(row["user"], avg_user)
+                b_ind = get_indicator(row["block_cost"], avg_block_cost)
+                tm_ind = get_indicator(row["time_ms"], avg_time_ms)
+
+                txns_str = f"{row['txns']:>6,}{t_ind:>2}"
+                votes_str = f"{row['votes']:>6,}{v_ind:>2}"
+                user_str = f"{row['user']:>6,}{u_ind:>2}"
+                block_str = f"{row['block_cost']:>13,}{b_ind:>2}"
+                time_str = f"{row['time_ms']:>10.1f}{tm_ind:>2}"
+
+                print(f"{row['slot']:<26} | {txns_str} | {votes_str} | {user_str} | {block_str} | {time_str} | {format_lamports(row['total_fee']):>14} | {format_lamports(row['priority_fee']):>14}")
+
+        print("-" * 156)
+        print(f"{'TOTAL':<26} | {total_txns:>8,} | {total_votes:>8,} | {total_user:>8,} | {total_block_cost:>15,} | {avg_time_ms:>12.1f} | {format_lamports(total_total_fee):>14} | {format_lamports(total_priority_fee):>14}")
         slots_label = f"({slot_count} produced, {skipped_count} skipped)"
-        print(f"{slots_label:<26} | {'':>6} | {'':>6} | {'':>6} | {'':>12} | {'(avg)':>10} | {'':>14} | {'':>14}")
-        print("=" * 144)
+        print(f"{slots_label:<26} | {'(avg)':>8} | {'(avg)':>8} | {'(avg)':>8} | {'(avg)':>15} | {'(avg)':>12} | {'':>14} | {'':>14}")
+        print("=" * 156)
 
     # Additional stats
     if active_minutes:
