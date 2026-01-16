@@ -47,6 +47,7 @@ Edit the variables at the top of the script to set your defaults:
 ```python
 VALIDATOR_LOG = "/home/sol/logs/validator.log"  # Default log file path
 SERVICE_NAME = "sol.service"                     # Default systemd service name
+VOTE_CU_COST = 3428                              # Vote transaction CU cost (from Solana source)
 ```
 
 ## Output
@@ -71,24 +72,47 @@ SERVICE_NAME = "sol.service"                     # Default systemd service name
 | Outbound Fail | Outbound message failures (outbound_fail) |
 | Total | Total failures for that period |
 
+### Leader Slot Metrics Table
+
+| Column | Description |
+|--------|-------------|
+| Slot | Slot number |
+| Txns | Total transactions in the block |
+| Votes | Estimated vote transactions |
+| User | Estimated user (non-vote) transactions |
+| Block CUs | Total compute units consumed |
+| Time (ms) | Block production time in milliseconds |
+| Total Fee | Total transaction fees (in SOL) |
+| Priority Fee | Priority fees portion (in SOL) |
+
+Skipped slots (announced but not produced) are shown inline with "SKIPPED" in the Priority Fee column and dashes for other metrics.
+
 ## Sample Output
 
 ```
 Analyzing: /home/sol/logs/validator.log
-Please wait, processing logs...
+Processing logs.............................. done (11,166,156 lines)
 
-===============================================================================================
+======================================BAM BUNDLE ACTIVITY======================================
 Time (UTC)           | Slot Range                |    Bundles | Results Sent |   % Sent
 -----------------------------------------------------------------------------------------------
 2026-01-16T01:20     | 393779538 - 393779692     |      2,150 |        2,150 |   100.0%
 2026-01-16T01:35     | 393781801 - 393781953     |      2,198 |        2,198 |   100.0%
-2026-01-16T02:34     | 393790760 - 393790914     |      2,561 |        2,561 |   100.0%
-2026-01-16T05:06     | 393813811 - 393813964     |      3,568 |        3,568 |   100.0%
-2026-01-16T05:31     | 393817590 - 393817741     |      2,911 |        2,911 |   100.0%
 ...
 -----------------------------------------------------------------------------------------------
 TOTAL                | 22 periods                |    102,927 |      102,927 |   100.0%
 ===============================================================================================
+
+==============================================================LEADER SLOT METRICS===============================================================
+Slot                       |   Txns |  Votes |   User |    Block CUs |  Time (ms) |      Total Fee |   Priority Fee
+------------------------------------------------------------------------------------------------------------------------------------------------
+393779592                  |  1,314 |    778 |    536 |   45,354,622 |      345.2 |       0.021618 |       0.014393
+393779593                  |  1,072 |    787 |    285 |   23,140,917 |      288.7 |       0.013247 |       0.007582
+...
+------------------------------------------------------------------------------------------------------------------------------------------------
+TOTAL                      | 116,108 | 72,354 | 43,754 | 3,802,340,772 |      311.0 |         3.0066 |         2.3771
+(92 produced, 0 skipped)   |        |        |        |              |      (avg) |                |
+================================================================================================================================================
 
 Time range: 2026-01-16 01:20 to 2026-01-16 15:40 UTC
 Leader periods: 22
@@ -101,26 +125,18 @@ No failures detected.
 
 Connection health:
   Heartbeats received (during leader periods): 660
-  Heartbeats received (total): 29,006
-  Unhealthy connection events: 0 (healthy throughout)
-```
+  Heartbeats received (total): 30,656
+  Unhealthy connection events: 81
 
-### Sample Output with Failures
-
-If failures are detected, a second table is displayed:
-
-```
-=======================================FAILURES DETECTED=======================================
-Time (UTC)           | Slot Range                | Sched Fail | Outbound Fail |    Total
------------------------------------------------------------------------------------------------
-2026-01-16T05:06     | 393813811 - 393813964     |         12 |             3 |       15
------------------------------------------------------------------------------------------------
-TOTAL FAILURES       |                           |         12 |             3 |       15
-===============================================================================================
-
-Total failures: 15 (0.01% of bundles)
-  Scheduler failures: 12
-  Outbound failures: 3
+Leader slot summary:
+  Slots produced: 92
+  Slots skipped: 0
+  Total transactions: 116,108 (72,354 votes, 43,754 user)
+  Total compute units: 3,802,340,772
+  Total fees: 3.0066 SOL
+  Total priority fees: 2.3771 SOL
+  Avg transactions per slot: 1,262
+  Avg block time: 311.0 ms
 ```
 
 ## Requirements
@@ -149,16 +165,54 @@ Note: If your validator uses `--log /path/to/file` in its startup command, logs 
 3. Correlates timestamps with `bank frozen` entries to get slot numbers
 4. Tracks failure metrics (`bundle_forward_to_scheduler_fail`, `outbound_fail`)
 5. Tracks connection health (`heartbeat_received`, `unhealthy_connection_count`)
-6. Aggregates data by minute and produces the report
+6. Collects per-slot leader metrics from `cost_tracker_stats` and timing logs
+7. Detects skipped leader slots by comparing announced vs produced slots
+8. Aggregates data and produces the report
 
 Bundle activity only occurs during your validator's leader slots, so this effectively shows your leader slot activity with BAM.
 
 ## Metrics Tracked
 
-From `bam_connection-metrics`:
-- `bundle_received` - Bundles received from BAM node
-- `bundleresult_sent` - Bundle results sent back
-- `bundle_forward_to_scheduler_fail` - Failed to forward bundle to scheduler
-- `outbound_fail` - Failed outbound messages
-- `heartbeat_received` - Heartbeats received from BAM node
-- `unhealthy_connection_count` - Connection health check failures
+### From `bam_connection-metrics` log entries:
+
+| Field | Description |
+|-------|-------------|
+| `bundle_received` | Bundles received from BAM block builders |
+| `bundleresult_sent` | Bundle execution results sent back to builders |
+| `bundle_forward_to_scheduler_fail` | Failed attempts to forward bundle to transaction scheduler |
+| `outbound_fail` | Failed outbound messages to BAM node |
+| `heartbeat_received` | Heartbeats received from BAM node |
+| `unhealthy_connection_count` | Connection health check failures |
+
+### From `cost_tracker_stats,is_leader=true` log entries:
+
+| Field | Description |
+|-------|-------------|
+| `bank_slot` | Slot number for the block |
+| `transaction_count` | Total transactions included in the block |
+| `vote_cost` | Compute units consumed by vote transactions |
+| `block_cost` | Total compute units consumed by the block |
+| `total_transaction_fee` | Total transaction fees collected (in lamports) |
+| `total_priority_fee` | Priority fees portion of total fees (in lamports) |
+
+### From `broadcast-process-shreds-stats` log entries:
+
+| Field | Description |
+|-------|-------------|
+| `slot` | Slot number |
+| `slot_broadcast_time` | Time to broadcast block shreds (microseconds) |
+
+### From `replay_stage-my_leader_slot` log entries:
+
+| Field | Description |
+|-------|-------------|
+| `slot` | Announced leader slot number |
+
+### Derived metrics:
+
+| Metric | Calculation |
+|--------|-------------|
+| Vote transactions | `vote_cost / 3428` (SIMPLE_VOTE_USAGE_COST from Solana source) |
+| User transactions | `transaction_count - vote_transactions` |
+| Block time (ms) | `slot_broadcast_time / 1000` |
+| Skipped slots | Slots in `replay_stage-my_leader_slot` but not in `cost_tracker_stats` |

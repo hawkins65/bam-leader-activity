@@ -19,6 +19,9 @@ from datetime import datetime
 # =============================================================================
 VALIDATOR_LOG = "/home/sol/logs/validator.log"
 SERVICE_NAME = "sol.service"
+
+# Vote transaction cost from solana source: SIMPLE_VOTE_USAGE_COST
+VOTE_CU_COST = 3428
 # =============================================================================
 
 def parse_timestamp(line):
@@ -94,13 +97,23 @@ def get_lines_from_journalctl(service):
         print(f"Error running journalctl: {e}")
         sys.exit(1)
 
+def format_lamports(lamports):
+    """Format lamports as SOL with appropriate precision"""
+    sol = lamports / 1_000_000_000
+    if sol >= 1:
+        return f"{sol:.4f}"
+    elif sol >= 0.001:
+        return f"{sol:.6f}"
+    else:
+        return f"{sol:.9f}"
+
 def analyze_logs(line_source, source_name):
     """Analyze log lines and produce the report"""
 
     print(f"Analyzing: {source_name}")
-    print("Please wait, processing logs...\n")
+    print("Processing logs", end="", flush=True)
 
-    # Data structures to collect metrics per minute
+    # Data structures to collect metrics per minute (for BAM bundle activity)
     bundle_data = defaultdict(lambda: {
         "bundles": 0,
         "results_sent": 0,
@@ -112,11 +125,15 @@ def analyze_logs(line_source, source_name):
     })
     slot_data = defaultdict(list)  # minute -> list of slots
 
+    # Per-slot leader metrics
+    leader_slots_announced = set()  # replay_stage-my_leader_slot
+    leader_slot_metrics = {}  # slot -> metrics dict
+
     # Global health tracking (across all time, not just active periods)
     global_heartbeats = 0
     global_unhealthy = 0
 
-    # Regex patterns
+    # Regex patterns for BAM metrics
     bundle_rx = re.compile(r'bundle_received=(\d+)i')
     results_rx = re.compile(r'bundleresult_sent=(\d+)i')
     scheduler_fail_rx = re.compile(r'bundle_forward_to_scheduler_fail=(\d+)i')
@@ -125,9 +142,30 @@ def analyze_logs(line_source, source_name):
     heartbeat_rx = re.compile(r'heartbeat_received=(\d+)i')
     slot_rx = re.compile(r'bank frozen: (\d+)')
 
+    # Regex patterns for leader slot metrics
+    my_leader_slot_rx = re.compile(r'replay_stage-my_leader_slot slot=(\d+)i')
+    cost_tracker_rx = re.compile(
+        r'cost_tracker_stats,is_leader=true bank_slot=(\d+)i '
+        r'block_cost=(\d+)i vote_cost=(\d+)i transaction_count=(\d+)i.*?'
+        r'total_transaction_fee=(\d+)i total_priority_fee=(\d+)i'
+    )
+    broadcast_rx = re.compile(
+        r'broadcast-process-shreds-stats slot=(\d+)i.*?'
+        r'slot_broadcast_time=(\d+)i'
+    )
+    scheduler_timing_rx = re.compile(
+        r'banking_stage_scheduler_slot_timing.*?'
+        r'receive_time_us=(\d+)i.*?'
+        r'schedule_time_us=(\d+)i.*?'
+        r'slot=(\d+)i'
+    )
+
     line_count = 0
+    progress_interval = 100000
     for line in line_source:
         line_count += 1
+        if line_count % progress_interval == 0:
+            print(".", end="", flush=True)
         _, minute_key = parse_timestamp(line)
         if not minute_key:
             continue
@@ -175,6 +213,53 @@ def analyze_logs(line_source, source_name):
                 slot = int(slot_match.group(1))
                 slot_data[minute_key].append(slot)
 
+        # Check for leader slot announcement
+        elif 'replay_stage-my_leader_slot' in line:
+            match = my_leader_slot_rx.search(line)
+            if match:
+                slot = int(match.group(1))
+                leader_slots_announced.add(slot)
+
+        # Check for cost tracker stats (leader slots)
+        elif 'cost_tracker_stats,is_leader=true' in line:
+            match = cost_tracker_rx.search(line)
+            if match:
+                slot = int(match.group(1))
+                if slot not in leader_slot_metrics:
+                    leader_slot_metrics[slot] = {}
+                leader_slot_metrics[slot].update({
+                    "block_cost": int(match.group(2)),
+                    "vote_cost": int(match.group(3)),
+                    "transaction_count": int(match.group(4)),
+                    "total_fee": int(match.group(5)),
+                    "priority_fee": int(match.group(6)),
+                })
+
+        # Check for broadcast stats
+        elif 'broadcast-process-shreds-stats' in line:
+            match = broadcast_rx.search(line)
+            if match:
+                slot = int(match.group(1))
+                broadcast_time = int(match.group(2))
+                if slot not in leader_slot_metrics:
+                    leader_slot_metrics[slot] = {}
+                leader_slot_metrics[slot]["broadcast_time_us"] = broadcast_time
+
+        # Check for scheduler timing
+        elif 'banking_stage_scheduler_slot_timing' in line:
+            match = scheduler_timing_rx.search(line)
+            if match:
+                receive_time = int(match.group(1))
+                schedule_time = int(match.group(2))
+                slot = int(match.group(3))
+                if slot not in leader_slot_metrics:
+                    leader_slot_metrics[slot] = {}
+                # Accumulate timing (there can be multiple entries per slot)
+                leader_slot_metrics[slot]["receive_time_us"] = leader_slot_metrics[slot].get("receive_time_us", 0) + receive_time
+                leader_slot_metrics[slot]["schedule_time_us"] = leader_slot_metrics[slot].get("schedule_time_us", 0) + schedule_time
+
+    print(f" done ({line_count:,} lines)\n")
+
     if line_count == 0:
         print("No log lines found.")
         sys.exit(1)
@@ -186,8 +271,8 @@ def analyze_logs(line_source, source_name):
         print(f"No bundle activity found in {line_count:,} log lines.")
         sys.exit(0)
 
-    # Print table header
-    print("=" * 95)
+    # Print BAM Bundle Activity table
+    print(f"{'BAM BUNDLE ACTIVITY':=^95}")
     print(f"{'Time (UTC)':<20} | {'Slot Range':<25} | {'Bundles':>10} | {'Results Sent':>12} | {'% Sent':>8}")
     print("-" * 95)
 
@@ -237,7 +322,6 @@ def analyze_logs(line_source, source_name):
     # Print failures table if any failures occurred
     total_failures = total_scheduler_fail + total_outbound_fail
     if total_failures > 0:
-        # Find minutes with failures
         fail_minutes = sorted([m for m, d in bundle_data.items()
                               if d["scheduler_fail"] > 0 or d["outbound_fail"] > 0])
 
@@ -263,6 +347,72 @@ def analyze_logs(line_source, source_name):
         print("-" * 95)
         print(f"{'TOTAL FAILURES':<20} | {'':<25} | {total_scheduler_fail:>10,} | {total_outbound_fail:>13,} | {total_failures:>8,}")
         print("=" * 95)
+
+    # Print Leader Slot Metrics table
+    if leader_slot_metrics or leader_slots_announced:
+        # Detect skipped slots
+        skipped_slots = leader_slots_announced - set(leader_slot_metrics.keys())
+
+        # Combine all leader slots (produced + skipped) for display
+        all_leader_slots = sorted(set(leader_slot_metrics.keys()) | skipped_slots)
+
+        print(f"\n{'LEADER SLOT METRICS':=^144}")
+        print(f"{'Slot':<26} | {'Txns':>6} | {'Votes':>6} | {'User':>6} | {'Block CUs':>12} | {'Time (ms)':>10} | {'Total Fee':>14} | {'Priority Fee':>14}")
+        print("-" * 144)
+
+        # Totals for leader slot summary
+        total_txns = 0
+        total_votes = 0
+        total_user = 0
+        total_block_cost = 0
+        total_time_us = 0
+        total_total_fee = 0
+        total_priority_fee = 0
+        slot_count = 0
+        skipped_count = 0
+
+        for slot in all_leader_slots:
+            if slot in skipped_slots:
+                # Skipped slot - show with dashes
+                print(f"{slot:<26} | {'---':>6} | {'---':>6} | {'---':>6} | {'---':>12} | {'---':>10} | {'---':>14} | {'SKIPPED':>14}")
+                skipped_count += 1
+            else:
+                m = leader_slot_metrics[slot]
+
+                txns = m.get("transaction_count", 0)
+                vote_cost = m.get("vote_cost", 0)
+                block_cost = m.get("block_cost", 0)
+                total_fee = m.get("total_fee", 0)
+                priority_fee = m.get("priority_fee", 0)
+                broadcast_time = m.get("broadcast_time_us", 0)
+                receive_time = m.get("receive_time_us", 0)
+                schedule_time = m.get("schedule_time_us", 0)
+
+                # Estimate vote vs user transactions
+                est_votes = vote_cost // VOTE_CU_COST if vote_cost > 0 else 0
+                est_user = max(0, txns - est_votes)
+
+                # Total slot time (use broadcast time as primary, fall back to receive+schedule)
+                slot_time_us = broadcast_time if broadcast_time > 0 else (receive_time + schedule_time)
+                slot_time_ms = slot_time_us / 1000
+
+                print(f"{slot:<26} | {txns:>6,} | {est_votes:>6,} | {est_user:>6,} | {block_cost:>12,} | {slot_time_ms:>10.1f} | {format_lamports(total_fee):>14} | {format_lamports(priority_fee):>14}")
+
+                total_txns += txns
+                total_votes += est_votes
+                total_user += est_user
+                total_block_cost += block_cost
+                total_time_us += slot_time_us
+                total_total_fee += total_fee
+                total_priority_fee += priority_fee
+                slot_count += 1
+
+        print("-" * 144)
+        avg_time_ms = (total_time_us / slot_count / 1000) if slot_count > 0 else 0
+        print(f"{'TOTAL':<26} | {total_txns:>6,} | {total_votes:>6,} | {total_user:>6,} | {total_block_cost:>12,} | {avg_time_ms:>10.1f} | {format_lamports(total_total_fee):>14} | {format_lamports(total_priority_fee):>14}")
+        slots_label = f"({slot_count} produced, {skipped_count} skipped)"
+        print(f"{slots_label:<26} | {'':>6} | {'':>6} | {'':>6} | {'':>12} | {'(avg)':>10} | {'':>14} | {'':>14}")
+        print("=" * 144)
 
     # Additional stats
     if active_minutes:
@@ -295,6 +445,22 @@ def analyze_logs(line_source, source_name):
             print(f"  Unhealthy connection events: {global_unhealthy:,}")
         else:
             print(f"  Unhealthy connection events: 0 (healthy throughout)")
+
+        # Leader slot summary
+        if leader_slot_metrics or leader_slots_announced:
+            print(f"\nLeader slot summary:")
+            print(f"  Slots produced: {slot_count}")
+            print(f"  Slots skipped: {skipped_count}")
+            if skipped_count > 0:
+                skip_rate = (skipped_count / (slot_count + skipped_count)) * 100
+                print(f"  Skip rate: {skip_rate:.2f}%")
+            print(f"  Total transactions: {total_txns:,} ({total_votes:,} votes, {total_user:,} user)")
+            print(f"  Total compute units: {total_block_cost:,}")
+            print(f"  Total fees: {format_lamports(total_total_fee)} SOL")
+            print(f"  Total priority fees: {format_lamports(total_priority_fee)} SOL")
+            if slot_count > 0:
+                print(f"  Avg transactions per slot: {total_txns // slot_count:,}")
+                print(f"  Avg block time: {avg_time_ms:.1f} ms")
 
 def main():
     # Parse arguments
