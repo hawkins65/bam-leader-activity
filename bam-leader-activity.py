@@ -2,7 +2,7 @@
 """
 BAM Leader Slot Activity Analyzer
 
-Analyzes validator logs to correlate BAM (Block Auction Marketplace) bundle activity with leader slots.
+Analyzes validator logs to correlate BAM (Block Assembly Marketplace) bundle activity with leader slots.
 Produces a table showing when bundles were received during leader slots.
 
 Supports reading from a log file or from journalctl.

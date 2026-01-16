@@ -1,6 +1,6 @@
 # BAM Leader Activity Analyzer
 
-Analyzes Solana validator logs to correlate BAM (Block Auction Marketplace) bundle activity with leader slots.
+Analyzes Solana validator logs to correlate BAM (Block Assembly Marketplace) bundle activity with leader slots.
 
 ## Usage
 
