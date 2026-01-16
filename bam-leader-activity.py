@@ -101,12 +101,28 @@ def analyze_logs(line_source, source_name):
     print("Please wait, processing logs...\n")
 
     # Data structures to collect metrics per minute
-    bundle_data = defaultdict(lambda: {"bundles": 0, "results_sent": 0, "count": 0})
+    bundle_data = defaultdict(lambda: {
+        "bundles": 0,
+        "results_sent": 0,
+        "scheduler_fail": 0,
+        "outbound_fail": 0,
+        "unhealthy_count": 0,
+        "heartbeat_received": 0,
+        "count": 0
+    })
     slot_data = defaultdict(list)  # minute -> list of slots
+
+    # Global health tracking (across all time, not just active periods)
+    global_heartbeats = 0
+    global_unhealthy = 0
 
     # Regex patterns
     bundle_rx = re.compile(r'bundle_received=(\d+)i')
     results_rx = re.compile(r'bundleresult_sent=(\d+)i')
+    scheduler_fail_rx = re.compile(r'bundle_forward_to_scheduler_fail=(\d+)i')
+    outbound_fail_rx = re.compile(r'outbound_fail=(\d+)i')
+    unhealthy_rx = re.compile(r'unhealthy_connection_count=(\d+)i')
+    heartbeat_rx = re.compile(r'heartbeat_received=(\d+)i')
     slot_rx = re.compile(r'bank frozen: (\d+)')
 
     line_count = 0
@@ -120,6 +136,10 @@ def analyze_logs(line_source, source_name):
         if 'bam_connection-metrics' in line:
             bundle_match = bundle_rx.search(line)
             results_match = results_rx.search(line)
+            scheduler_fail_match = scheduler_fail_rx.search(line)
+            outbound_fail_match = outbound_fail_rx.search(line)
+            unhealthy_match = unhealthy_rx.search(line)
+            heartbeat_match = heartbeat_rx.search(line)
 
             if bundle_match:
                 bundles = int(bundle_match.group(1))
@@ -129,6 +149,24 @@ def analyze_logs(line_source, source_name):
             if results_match:
                 results = int(results_match.group(1))
                 bundle_data[minute_key]["results_sent"] += results
+
+            if scheduler_fail_match:
+                scheduler_fail = int(scheduler_fail_match.group(1))
+                bundle_data[minute_key]["scheduler_fail"] += scheduler_fail
+
+            if outbound_fail_match:
+                outbound_fail = int(outbound_fail_match.group(1))
+                bundle_data[minute_key]["outbound_fail"] += outbound_fail
+
+            if unhealthy_match:
+                unhealthy = int(unhealthy_match.group(1))
+                bundle_data[minute_key]["unhealthy_count"] += unhealthy
+                global_unhealthy += unhealthy
+
+            if heartbeat_match:
+                heartbeat = int(heartbeat_match.group(1))
+                bundle_data[minute_key]["heartbeat_received"] += heartbeat
+                global_heartbeats += heartbeat
 
         # Check for bank frozen (slot info)
         elif 'bank frozen:' in line:
@@ -156,6 +194,10 @@ def analyze_logs(line_source, source_name):
     # Totals for summary
     total_bundles = 0
     total_results = 0
+    total_scheduler_fail = 0
+    total_outbound_fail = 0
+    total_unhealthy = 0
+    total_heartbeats = 0
     total_periods = 0
 
     for minute in active_minutes:
@@ -179,6 +221,10 @@ def analyze_logs(line_source, source_name):
 
         total_bundles += bundles
         total_results += results
+        total_scheduler_fail += data["scheduler_fail"]
+        total_outbound_fail += data["outbound_fail"]
+        total_unhealthy += data["unhealthy_count"]
+        total_heartbeats += data["heartbeat_received"]
         total_periods += 1
 
     # Print summary
@@ -187,6 +233,36 @@ def analyze_logs(line_source, source_name):
     total_pct = (total_results / total_bundles * 100) if total_bundles > 0 else 0
     print(f"{'TOTAL':<20} | {periods_str:<25} | {total_bundles:>10,} | {total_results:>12,} | {total_pct:>7.1f}%")
     print("=" * 95)
+
+    # Print failures table if any failures occurred
+    total_failures = total_scheduler_fail + total_outbound_fail
+    if total_failures > 0:
+        # Find minutes with failures
+        fail_minutes = sorted([m for m, d in bundle_data.items()
+                              if d["scheduler_fail"] > 0 or d["outbound_fail"] > 0])
+
+        print(f"\n{'FAILURES DETECTED':=^95}")
+        print(f"{'Time (UTC)':<20} | {'Slot Range':<25} | {'Sched Fail':>10} | {'Outbound Fail':>13} | {'Total':>8}")
+        print("-" * 95)
+
+        for minute in fail_minutes:
+            data = bundle_data[minute]
+            slots = sorted(slot_data.get(minute, []))
+
+            if slots:
+                slot_range = f"{slots[0]} - {slots[-1]}" if len(slots) > 1 else str(slots[0])
+            else:
+                slot_range = "(no slot data)"
+
+            sched_fail = data["scheduler_fail"]
+            out_fail = data["outbound_fail"]
+            total_min_fail = sched_fail + out_fail
+
+            print(f"{minute:<20} | {slot_range:<25} | {sched_fail:>10,} | {out_fail:>13,} | {total_min_fail:>8,}")
+
+        print("-" * 95)
+        print(f"{'TOTAL FAILURES':<20} | {'':<25} | {total_scheduler_fail:>10,} | {total_outbound_fail:>13,} | {total_failures:>8,}")
+        print("=" * 95)
 
     # Additional stats
     if active_minutes:
@@ -201,6 +277,24 @@ def analyze_logs(line_source, source_name):
         if total_periods > 1:
             avg_bundles = total_bundles / total_periods
             print(f"Average bundles per leader period: {avg_bundles:,.0f}")
+
+        # Failure stats
+        if total_failures > 0:
+            fail_rate = (total_failures / total_bundles * 100) if total_bundles > 0 else 0
+            print(f"\nTotal failures: {total_failures:,} ({fail_rate:.2f}% of bundles)")
+            print(f"  Scheduler failures: {total_scheduler_fail:,}")
+            print(f"  Outbound failures: {total_outbound_fail:,}")
+        else:
+            print(f"\nNo failures detected.")
+
+        # Connection health stats
+        print(f"\nConnection health:")
+        print(f"  Heartbeats received (during leader periods): {total_heartbeats:,}")
+        print(f"  Heartbeats received (total): {global_heartbeats:,}")
+        if global_unhealthy > 0:
+            print(f"  Unhealthy connection events: {global_unhealthy:,}")
+        else:
+            print(f"  Unhealthy connection events: 0 (healthy throughout)")
 
 def main():
     # Parse arguments

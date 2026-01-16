@@ -51,7 +51,7 @@ SERVICE_NAME = "sol.service"                     # Default systemd service name
 
 ## Output
 
-Produces a table showing:
+### Bundle Activity Table
 
 | Column | Description |
 |--------|-------------|
@@ -61,7 +61,15 @@ Produces a table showing:
 | Results Sent | Number of bundle results sent back |
 | % Sent | Percentage of bundles that received results |
 
-Includes a summary line with totals and additional statistics including overall send rate.
+### Failures Table (shown only if failures detected)
+
+| Column | Description |
+|--------|-------------|
+| Time (UTC) | Minute window when failures occurred |
+| Slot Range | The slots being processed during that period |
+| Sched Fail | Scheduler failures (bundle_forward_to_scheduler_fail) |
+| Outbound Fail | Outbound message failures (outbound_fail) |
+| Total | Total failures for that period |
 
 ## Sample Output
 
@@ -88,6 +96,31 @@ Total bundles received: 102,927
 Total bundle results sent: 102,927
 Overall send rate: 100.0%
 Average bundles per leader period: 4,678
+
+No failures detected.
+
+Connection health:
+  Heartbeats received (during leader periods): 660
+  Heartbeats received (total): 29,006
+  Unhealthy connection events: 0 (healthy throughout)
+```
+
+### Sample Output with Failures
+
+If failures are detected, a second table is displayed:
+
+```
+=======================================FAILURES DETECTED=======================================
+Time (UTC)           | Slot Range                | Sched Fail | Outbound Fail |    Total
+-----------------------------------------------------------------------------------------------
+2026-01-16T05:06     | 393813811 - 393813964     |         12 |             3 |       15
+-----------------------------------------------------------------------------------------------
+TOTAL FAILURES       |                           |         12 |             3 |       15
+===============================================================================================
+
+Total failures: 15 (0.01% of bundles)
+  Scheduler failures: 12
+  Outbound failures: 3
 ```
 
 ## Requirements
@@ -114,6 +147,18 @@ Note: If your validator uses `--log /path/to/file` in its startup command, logs 
 1. Scans validator log for `bam_connection-metrics` entries
 2. Identifies periods with non-zero `bundle_received` values
 3. Correlates timestamps with `bank frozen` entries to get slot numbers
-4. Aggregates data by minute and produces the report
+4. Tracks failure metrics (`bundle_forward_to_scheduler_fail`, `outbound_fail`)
+5. Tracks connection health (`heartbeat_received`, `unhealthy_connection_count`)
+6. Aggregates data by minute and produces the report
 
 Bundle activity only occurs during your validator's leader slots, so this effectively shows your leader slot activity with BAM.
+
+## Metrics Tracked
+
+From `bam_connection-metrics`:
+- `bundle_received` - Bundles received from BAM node
+- `bundleresult_sent` - Bundle results sent back
+- `bundle_forward_to_scheduler_fail` - Failed to forward bundle to scheduler
+- `outbound_fail` - Failed outbound messages
+- `heartbeat_received` - Heartbeats received from BAM node
+- `unhealthy_connection_count` - Connection health check failures
