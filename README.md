@@ -188,38 +188,38 @@ Bundle activity only occurs during your validator's leader slots, so this effect
 
 ### From `bam_connection-metrics` log entries:
 
-| Field | Description |
-|-------|-------------|
-| `bundle_received` | Bundles received from BAM block builders |
-| `bundleresult_sent` | Bundle execution results sent back to builders |
-| `bundle_forward_to_scheduler_fail` | Failed attempts to forward bundle to transaction scheduler |
-| `outbound_fail` | Failed outbound messages to BAM node |
-| `heartbeat_received` | Heartbeats received from BAM node |
-| `unhealthy_connection_count` | Connection health check failures |
+| Field | Description | Grep Example |
+|-------|-------------|--------------|
+| `bundle_received` | Bundles received from BAM block builders | `grep "bam_connection-metrics" validator.log \| grep "bundle_received"` |
+| `bundleresult_sent` | Bundle execution results sent back to builders | `grep "bundleresult_sent" validator.log` |
+| `bundle_forward_to_scheduler_fail` | Failed attempts to forward bundle to scheduler | `grep "bundle_forward_to_scheduler_fail" validator.log` |
+| `outbound_fail` | Failed outbound messages to BAM node | `grep "outbound_fail" validator.log` |
+| `heartbeat_received` | Heartbeats received from BAM node | `grep "heartbeat_received" validator.log` |
+| `unhealthy_connection_count` | Connection health check failures | `grep "unhealthy_connection_count" validator.log` |
 
 ### From `cost_tracker_stats,is_leader=true` log entries:
 
-| Field | Description |
-|-------|-------------|
-| `bank_slot` | Slot number for the block |
-| `transaction_count` | Total transactions included in the block |
-| `vote_cost` | Compute units consumed by vote transactions |
-| `block_cost` | Total compute units consumed by the block |
-| `total_transaction_fee` | Total transaction fees collected (in lamports) |
-| `total_priority_fee` | Priority fees portion of total fees (in lamports) |
+| Field | Description | Grep Example |
+|-------|-------------|--------------|
+| `bank_slot` | Slot number for the block | `grep "cost_tracker_stats,is_leader=true" validator.log` |
+| `transaction_count` | Total transactions included in the block | `grep "cost_tracker_stats,is_leader=true" validator.log` |
+| `vote_cost` | Compute units consumed by vote transactions | `grep "cost_tracker_stats,is_leader=true" validator.log` |
+| `block_cost` | Total compute units consumed by the block | `grep "cost_tracker_stats,is_leader=true" validator.log` |
+| `total_transaction_fee` | Total transaction fees collected (in lamports) | `grep "cost_tracker_stats,is_leader=true" validator.log` |
+| `total_priority_fee` | Priority fees portion of total fees (in lamports) | `grep "cost_tracker_stats,is_leader=true" validator.log` |
 
 ### From `broadcast-process-shreds-stats` log entries:
 
-| Field | Description |
-|-------|-------------|
-| `slot` | Slot number |
-| `slot_broadcast_time` | Time to broadcast block shreds (microseconds) |
+| Field | Description | Grep Example |
+|-------|-------------|--------------|
+| `slot` | Slot number | `grep "broadcast-process-shreds-stats" validator.log` |
+| `slot_broadcast_time` | Time to broadcast block shreds (microseconds) | `grep "slot_broadcast_time" validator.log` |
 
 ### From `replay_stage-my_leader_slot` log entries:
 
-| Field | Description |
-|-------|-------------|
-| `slot` | Announced leader slot number |
+| Field | Description | Grep Example |
+|-------|-------------|--------------|
+| `slot` | Announced leader slot number | `grep "replay_stage-my_leader_slot" validator.log` |
 
 ### Derived metrics:
 
