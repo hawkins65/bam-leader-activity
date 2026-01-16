@@ -149,9 +149,9 @@ def analyze_logs(line_source, source_name):
         sys.exit(0)
 
     # Print table header
-    print("=" * 85)
-    print(f"{'Time (UTC)':<20} | {'Slot Range':<25} | {'Bundles':>10} | {'Results Sent':>12}")
-    print("-" * 85)
+    print("=" * 95)
+    print(f"{'Time (UTC)':<20} | {'Slot Range':<25} | {'Bundles':>10} | {'Results Sent':>12} | {'% Sent':>8}")
+    print("-" * 95)
 
     # Totals for summary
     total_bundles = 0
@@ -173,18 +173,20 @@ def analyze_logs(line_source, source_name):
 
         bundles = data["bundles"]
         results = data["results_sent"]
+        pct_sent = (results / bundles * 100) if bundles > 0 else 0
 
-        print(f"{minute:<20} | {slot_range:<25} | {bundles:>10,} | {results:>12,}")
+        print(f"{minute:<20} | {slot_range:<25} | {bundles:>10,} | {results:>12,} | {pct_sent:>7.1f}%")
 
         total_bundles += bundles
         total_results += results
         total_periods += 1
 
     # Print summary
-    print("-" * 85)
+    print("-" * 95)
     periods_str = f"{total_periods} periods"
-    print(f"{'TOTAL':<20} | {periods_str:<25} | {total_bundles:>10,} | {total_results:>12,}")
-    print("=" * 85)
+    total_pct = (total_results / total_bundles * 100) if total_bundles > 0 else 0
+    print(f"{'TOTAL':<20} | {periods_str:<25} | {total_bundles:>10,} | {total_results:>12,} | {total_pct:>7.1f}%")
+    print("=" * 95)
 
     # Additional stats
     if active_minutes:
@@ -194,6 +196,7 @@ def analyze_logs(line_source, source_name):
         print(f"Leader periods: {total_periods}")
         print(f"Total bundles received: {total_bundles:,}")
         print(f"Total bundle results sent: {total_results:,}")
+        print(f"Overall send rate: {total_pct:.1f}%")
 
         if total_periods > 1:
             avg_bundles = total_bundles / total_periods
