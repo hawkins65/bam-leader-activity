@@ -267,10 +267,6 @@ def analyze_logs(line_source, source_name):
     # Filter to only minutes with bundle activity (bundles > 0)
     active_minutes = sorted([m for m, d in bundle_data.items() if d["bundles"] > 0])
 
-    if not active_minutes:
-        print(f"No bundle activity found in {line_count:,} log lines.")
-        sys.exit(0)
-
     # Outlier threshold (20% above/below average)
     OUTLIER_PCT = 0.20
     UP_ARROW = "▲"
@@ -287,99 +283,106 @@ def analyze_logs(line_source, source_name):
             return DOWN_ARROW
         return ""
 
-    # First pass: collect BAM bundle data for averages
-    bundle_rows = []
+    # Initialize totals for summary section
     total_bundles = 0
     total_results = 0
     total_scheduler_fail = 0
     total_outbound_fail = 0
     total_unhealthy = 0
     total_heartbeats = 0
+    total_periods = 0
+    avg_bundles = 0
+    total_pct = 0
 
-    for minute in active_minutes:
-        data = bundle_data[minute]
-        slots = sorted(slot_data.get(minute, []))
+    # Print BAM Bundle Activity table (only if activity exists)
+    if active_minutes:
+        bundle_rows = []
 
-        # Format slot range
-        if slots:
-            if len(slots) == 1:
-                slot_range = str(slots[0])
-            else:
-                slot_range = f"{slots[0]} - {slots[-1]}"
-        else:
-            slot_range = "(no slot data)"
-
-        bundles = data["bundles"]
-        results = data["results_sent"]
-        pct_sent = (results / bundles * 100) if bundles > 0 else 0
-
-        bundle_rows.append({
-            "minute": minute,
-            "slot_range": slot_range,
-            "bundles": bundles,
-            "results": results,
-            "pct_sent": pct_sent
-        })
-
-        total_bundles += bundles
-        total_results += results
-        total_scheduler_fail += data["scheduler_fail"]
-        total_outbound_fail += data["outbound_fail"]
-        total_unhealthy += data["unhealthy_count"]
-        total_heartbeats += data["heartbeat_received"]
-
-    total_periods = len(bundle_rows)
-    avg_bundles = total_bundles / total_periods if total_periods > 0 else 0
-    avg_results = total_results / total_periods if total_periods > 0 else 0
-
-    # Print BAM Bundle Activity table
-    print(f"{'BAM BUNDLE ACTIVITY':=^99}")
-    print(f"{'Time (UTC)':<20} | {'Slot Range':<25} | {'Bundles':>12} | {'Results Sent':>14} | {'% Sent':>8}")
-    print("-" * 99)
-
-    for row in bundle_rows:
-        b_ind = get_indicator(row["bundles"], avg_bundles)
-        r_ind = get_indicator(row["results"], avg_results)
-        bundles_str = f"{row['bundles']:>10,}{b_ind:>2}"
-        results_str = f"{row['results']:>12,}{r_ind:>2}"
-        print(f"{row['minute']:<20} | {row['slot_range']:<25} | {bundles_str} | {results_str} | {row['pct_sent']:>7.1f}%")
-
-    # Print summary
-    print("-" * 99)
-    periods_str = f"{total_periods} periods"
-    total_pct = (total_results / total_bundles * 100) if total_bundles > 0 else 0
-    print(f"{'TOTAL':<20} | {periods_str:<25} | {total_bundles:>12,} | {total_results:>14,} | {total_pct:>7.1f}%")
-    print(f"{'(average)':<20} | {'':<25} | {avg_bundles:>12,.0f} | {avg_results:>14,.0f} |")
-    print("=" * 99)
-
-    # Print failures table if any failures occurred
-    total_failures = total_scheduler_fail + total_outbound_fail
-    if total_failures > 0:
-        fail_minutes = sorted([m for m, d in bundle_data.items()
-                              if d["scheduler_fail"] > 0 or d["outbound_fail"] > 0])
-
-        print(f"\n{'FAILURES DETECTED':=^99}")
-        print(f"{'Time (UTC)':<20} | {'Slot Range':<25} | {'Sched Fail':>12} | {'Outbound Fail':>14} | {'Total':>8}")
-        print("-" * 99)
-
-        for minute in fail_minutes:
+        for minute in active_minutes:
             data = bundle_data[minute]
             slots = sorted(slot_data.get(minute, []))
 
+            # Format slot range
             if slots:
-                slot_range = f"{slots[0]} - {slots[-1]}" if len(slots) > 1 else str(slots[0])
+                if len(slots) == 1:
+                    slot_range = str(slots[0])
+                else:
+                    slot_range = f"{slots[0]} - {slots[-1]}"
             else:
                 slot_range = "(no slot data)"
 
-            sched_fail = data["scheduler_fail"]
-            out_fail = data["outbound_fail"]
-            total_min_fail = sched_fail + out_fail
+            bundles = data["bundles"]
+            results = data["results_sent"]
+            pct_sent = (results / bundles * 100) if bundles > 0 else 0
 
-            print(f"{minute:<20} | {slot_range:<25} | {sched_fail:>12,} | {out_fail:>14,} | {total_min_fail:>8,}")
+            bundle_rows.append({
+                "minute": minute,
+                "slot_range": slot_range,
+                "bundles": bundles,
+                "results": results,
+                "pct_sent": pct_sent
+            })
 
+            total_bundles += bundles
+            total_results += results
+            total_scheduler_fail += data["scheduler_fail"]
+            total_outbound_fail += data["outbound_fail"]
+            total_unhealthy += data["unhealthy_count"]
+            total_heartbeats += data["heartbeat_received"]
+
+        total_periods = len(bundle_rows)
+        avg_bundles = total_bundles / total_periods if total_periods > 0 else 0
+        avg_results = total_results / total_periods if total_periods > 0 else 0
+
+        print(f"{'BAM BUNDLE ACTIVITY':=^99}")
+        print(f"{'Time (UTC)':<20} | {'Slot Range':<25} | {'Bundles':>12} | {'Results Sent':>14} | {'% Sent':>8}")
         print("-" * 99)
-        print(f"{'TOTAL FAILURES':<20} | {'':<25} | {total_scheduler_fail:>12,} | {total_outbound_fail:>14,} | {total_failures:>8,}")
+
+        for row in bundle_rows:
+            b_ind = get_indicator(row["bundles"], avg_bundles)
+            r_ind = get_indicator(row["results"], avg_results)
+            bundles_str = f"{row['bundles']:>10,}{b_ind:>2}"
+            results_str = f"{row['results']:>12,}{r_ind:>2}"
+            print(f"{row['minute']:<20} | {row['slot_range']:<25} | {bundles_str} | {results_str} | {row['pct_sent']:>7.1f}%")
+
+        # Print summary
+        print("-" * 99)
+        periods_str = f"{total_periods} periods"
+        total_pct = (total_results / total_bundles * 100) if total_bundles > 0 else 0
+        print(f"{'TOTAL':<20} | {periods_str:<25} | {total_bundles:>12,} | {total_results:>14,} | {total_pct:>7.1f}%")
+        print(f"{'(average)':<20} | {'':<25} | {avg_bundles:>12,.0f} | {avg_results:>14,.0f} |")
         print("=" * 99)
+
+        # Print failures table if any failures occurred
+        total_failures = total_scheduler_fail + total_outbound_fail
+        if total_failures > 0:
+            fail_minutes = sorted([m for m, d in bundle_data.items()
+                                  if d["scheduler_fail"] > 0 or d["outbound_fail"] > 0])
+
+            print(f"\n{'FAILURES DETECTED':=^99}")
+            print(f"{'Time (UTC)':<20} | {'Slot Range':<25} | {'Sched Fail':>12} | {'Outbound Fail':>14} | {'Total':>8}")
+            print("-" * 99)
+
+            for minute in fail_minutes:
+                data = bundle_data[minute]
+                slots = sorted(slot_data.get(minute, []))
+
+                if slots:
+                    slot_range = f"{slots[0]} - {slots[-1]}" if len(slots) > 1 else str(slots[0])
+                else:
+                    slot_range = "(no slot data)"
+
+                sched_fail = data["scheduler_fail"]
+                out_fail = data["outbound_fail"]
+                total_min_fail = sched_fail + out_fail
+
+                print(f"{minute:<20} | {slot_range:<25} | {sched_fail:>12,} | {out_fail:>14,} | {total_min_fail:>8,}")
+
+            print("-" * 99)
+            print(f"{'TOTAL FAILURES':<20} | {'':<25} | {total_scheduler_fail:>12,} | {total_outbound_fail:>14,} | {total_failures:>8,}")
+            print("=" * 99)
+    else:
+        print("No BAM bundle activity found.\n")
 
     # Print Leader Slot Metrics table
     if leader_slot_metrics or leader_slots_announced:
@@ -477,10 +480,18 @@ def analyze_logs(line_source, source_name):
                 print(f"{row['slot']:<26} | {txns_str} | {votes_str} | {user_str} | {block_str} | {time_str} | {format_lamports(row['total_fee']):>14} | {format_lamports(row['priority_fee']):>14}")
 
         print("-" * 156)
-        print(f"{'TOTAL':<26} | {total_txns:>8,} | {total_votes:>8,} | {total_user:>8,} | {total_block_cost:>15,} | {avg_time_ms:>12.1f} | {format_lamports(total_total_fee):>14} | {format_lamports(total_priority_fee):>14}")
+        # Calculate average fees
+        avg_total_fee = total_total_fee / slot_count if slot_count > 0 else 0
+        avg_priority_fee = total_priority_fee / slot_count if slot_count > 0 else 0
+
+        print(f"{'TOTAL':<26} | {total_txns:>8,} | {total_votes:>8,} | {total_user:>8,} | {total_block_cost:>15,} |              | {format_lamports(total_total_fee):>14} | {format_lamports(total_priority_fee):>14}")
         slots_label = f"({slot_count} produced, {skipped_count} skipped)"
-        print(f"{slots_label:<26} | {'(avg)':>8} | {'(avg)':>8} | {'(avg)':>8} | {'(avg)':>15} | {'(avg)':>12} | {'':>14} | {'':>14}")
+        print(f"{slots_label:<26} |          |          |          |                 |              |                |")
+        print(f"{'AVERAGE':<26} | {avg_txns:>8,.0f} | {avg_votes:>8,.0f} | {avg_user:>8,.0f} | {avg_block_cost:>15,.0f} | {avg_time_ms:>12.1f} | {format_lamports(avg_total_fee):>14} | {format_lamports(avg_priority_fee):>14}")
         print("=" * 156)
+    else:
+        print("No leader slot data found in logs.")
+        print("(Looking for 'cost_tracker_stats,is_leader=true' entries)\n")
 
     # Additional stats
     if active_minutes:
@@ -497,6 +508,7 @@ def analyze_logs(line_source, source_name):
             print(f"Average bundles per leader period: {avg_bundles:,.0f}")
 
         # Failure stats
+        total_failures = total_scheduler_fail + total_outbound_fail
         if total_failures > 0:
             fail_rate = (total_failures / total_bundles * 100) if total_bundles > 0 else 0
             print(f"\nTotal failures: {total_failures:,} ({fail_rate:.2f}% of bundles)")
@@ -514,21 +526,21 @@ def analyze_logs(line_source, source_name):
         else:
             print(f"  Unhealthy connection events: 0 (healthy throughout)")
 
-        # Leader slot summary
-        if leader_slot_metrics or leader_slots_announced:
-            print(f"\nLeader slot summary:")
-            print(f"  Slots produced: {slot_count}")
-            print(f"  Slots skipped: {skipped_count}")
-            if skipped_count > 0:
-                skip_rate = (skipped_count / (slot_count + skipped_count)) * 100
-                print(f"  Skip rate: {skip_rate:.2f}%")
-            print(f"  Total transactions: {total_txns:,} ({total_votes:,} votes, {total_user:,} user)")
-            print(f"  Total compute units: {total_block_cost:,}")
-            print(f"  Total fees: {format_lamports(total_total_fee)} SOL")
-            print(f"  Total priority fees: {format_lamports(total_priority_fee)} SOL")
-            if slot_count > 0:
-                print(f"  Avg transactions per slot: {total_txns // slot_count:,}")
-                print(f"  Avg block time: {avg_time_ms:.1f} ms")
+    # Leader slot summary (shown regardless of bundle activity)
+    if leader_slot_metrics or leader_slots_announced:
+        print(f"\nLeader slot summary:")
+        print(f"  Slots produced: {slot_count}")
+        print(f"  Slots skipped: {skipped_count}")
+        if skipped_count > 0:
+            skip_rate = (skipped_count / (slot_count + skipped_count)) * 100
+            print(f"  Skip rate: {skip_rate:.2f}%")
+        print(f"  Total transactions: {total_txns:,} ({total_votes:,} votes, {total_user:,} user)")
+        print(f"  Total compute units: {total_block_cost:,}")
+        print(f"  Total fees: {format_lamports(total_total_fee)} SOL")
+        print(f"  Total priority fees: {format_lamports(total_priority_fee)} SOL")
+        if slot_count > 0:
+            print(f"  Avg transactions per slot: {total_txns // slot_count:,}")
+            print(f"  Avg block time: {avg_time_ms:.1f} ms")
 
 def main():
     # Parse arguments
