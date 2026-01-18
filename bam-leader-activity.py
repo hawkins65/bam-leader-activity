@@ -274,19 +274,41 @@ def analyze_logs(line_source, source_name):
 
     # Outlier threshold (20% above/below average)
     OUTLIER_PCT = 0.20
+    # Small block threshold (below this percentage of median for key metrics)
+    SMALL_BLOCK_PCT = 0.25
     UP_ARROW = "▲"
     DOWN_ARROW = "▼"
+    SMALL_BLOCK_MARKER = "◆"
 
-    def get_indicator(value, avg):
-        """Return indicator if value is significantly above/below average"""
-        if avg == 0:
+    def get_indicator(value, median):
+        """Return indicator if value is significantly above/below median"""
+        if median == 0:
             return ""
-        pct_diff = (value - avg) / avg
+        pct_diff = (value - median) / median
         if pct_diff > OUTLIER_PCT:
             return UP_ARROW
         elif pct_diff < -OUTLIER_PCT:
             return DOWN_ARROW
         return ""
+
+    def get_median(values):
+        """Calculate median of a list of values"""
+        if not values:
+            return 0
+        sorted_values = sorted(values)
+        n = len(sorted_values)
+        if n % 2 == 0:
+            return (sorted_values[n // 2 - 1] + sorted_values[n // 2]) / 2
+        return sorted_values[n // 2]
+
+    def is_small_block(user_txns, block_cost, median_user, median_block_cost):
+        """Check if a block is a small block (key metrics way below median)"""
+        if median_user == 0 or median_block_cost == 0:
+            return False
+        user_ratio = user_txns / median_user
+        cost_ratio = block_cost / median_block_cost
+        # Both user txns AND block cost must be significantly below median
+        return user_ratio < SMALL_BLOCK_PCT and cost_ratio < SMALL_BLOCK_PCT
 
     # Initialize totals for summary section
     total_bundles = 0
@@ -296,7 +318,6 @@ def analyze_logs(line_source, source_name):
     total_unhealthy = 0
     total_heartbeats = 0
     total_periods = 0
-    avg_bundles = 0
     total_pct = 0
 
     # Print BAM Bundle Activity table (only if activity exists)
@@ -336,16 +357,18 @@ def analyze_logs(line_source, source_name):
             total_heartbeats += data["heartbeat_received"]
 
         total_periods = len(bundle_rows)
-        avg_bundles = total_bundles / total_periods if total_periods > 0 else 0
-        avg_results = total_results / total_periods if total_periods > 0 else 0
+
+        # Calculate medians for outlier detection
+        median_bundles = get_median([r["bundles"] for r in bundle_rows])
+        median_results = get_median([r["results"] for r in bundle_rows])
 
         print(f"{'BAM BUNDLE ACTIVITY':=^{BAM_TABLE_WIDTH}}")
         print(f"{'Time (UTC)':<20} | {'Slot Range':<25} | {'Bundles':>12} | {'Results Sent':>14} | {'% Sent':>8}")
         print("-" * BAM_TABLE_WIDTH)
 
         for row in bundle_rows:
-            b_ind = get_indicator(row["bundles"], avg_bundles)
-            r_ind = get_indicator(row["results"], avg_results)
+            b_ind = get_indicator(row["bundles"], median_bundles)
+            r_ind = get_indicator(row["results"], median_results)
             bundles_str = f"{row['bundles']:>10,}{b_ind:>2}"
             results_str = f"{row['results']:>12,}{r_ind:>2}"
             print(f"{row['minute']:<20} | {row['slot_range']:<25} | {bundles_str} | {results_str} | {row['pct_sent']:>7.1f}%")
@@ -355,7 +378,7 @@ def analyze_logs(line_source, source_name):
         periods_str = f"{total_periods} periods"
         total_pct = (total_results / total_bundles * 100) if total_bundles > 0 else 0
         print(f"{'TOTAL':<20} | {periods_str:<25} | {total_bundles:>12,} | {total_results:>14,} | {total_pct:>7.1f}%")
-        print(f"{'(average)':<20} | {'':<25} | {avg_bundles:>12,.0f} | {avg_results:>14,.0f} |")
+        print(f"{'(median)':<20} | {'':<25} | {median_bundles:>12,.0f} | {median_results:>14,.0f} |")
         print("=" * BAM_TABLE_WIDTH)
 
         # Print failures table if any failures occurred
@@ -409,6 +432,14 @@ def analyze_logs(line_source, source_name):
         total_priority_fee = 0
         slot_count = 0
         skipped_count = 0
+        small_block_count = 0
+
+        # Collect values for median calculation
+        all_txns = []
+        all_votes = []
+        all_user_txns = []
+        all_block_costs = []
+        all_time_ms = []
 
         for slot in all_leader_slots:
             if slot in skipped_slots:
@@ -443,8 +474,16 @@ def analyze_logs(line_source, source_name):
                     "block_cost": block_cost,
                     "time_ms": slot_time_ms,
                     "total_fee": total_fee,
-                    "priority_fee": priority_fee
+                    "priority_fee": priority_fee,
+                    "small_block": False  # Will be set in second pass
                 })
+
+                # Collect for median calculation
+                all_txns.append(txns)
+                all_votes.append(est_votes)
+                all_user_txns.append(est_user)
+                all_block_costs.append(block_cost)
+                all_time_ms.append(slot_time_ms)
 
                 total_txns += txns
                 total_votes += est_votes
@@ -455,12 +494,19 @@ def analyze_logs(line_source, source_name):
                 total_priority_fee += priority_fee
                 slot_count += 1
 
-        # Calculate averages
-        avg_txns = total_txns / slot_count if slot_count > 0 else 0
-        avg_votes = total_votes / slot_count if slot_count > 0 else 0
-        avg_user = total_user / slot_count if slot_count > 0 else 0
-        avg_block_cost = total_block_cost / slot_count if slot_count > 0 else 0
-        avg_time_ms = (total_time_us / slot_count / 1000) if slot_count > 0 else 0
+        # Calculate medians for outlier detection
+        median_txns = get_median(all_txns)
+        median_votes = get_median(all_votes)
+        median_user = get_median(all_user_txns)
+        median_block_cost = get_median(all_block_costs)
+        median_time_ms = get_median(all_time_ms)
+
+        # Second pass: mark small blocks
+        for row in slot_rows:
+            if not row.get("skipped", False):
+                if is_small_block(row["user"], row["block_cost"], median_user, median_block_cost):
+                    row["small_block"] = True
+                    small_block_count += 1
 
         # Print table with indicators
         print(f"\n{'LEADER SLOT METRICS':=^{LEADER_TABLE_WIDTH}}")
@@ -470,12 +516,22 @@ def analyze_logs(line_source, source_name):
         for row in slot_rows:
             if row["skipped"]:
                 print(f"{row['slot']:<26} | {'---':>8} | {'---':>8} | {'---':>8} | {'---':>15} | {'---':>12} | {'---':>14} | {'SKIPPED':>14}")
+            elif row.get("small_block"):
+                # Small block - highlight with marker
+                slot_str = f"{row['slot']} {SMALL_BLOCK_MARKER}"
+                txns_str = f"{row['txns']:>6,}{DOWN_ARROW:>2}"
+                votes_str = f"{row['votes']:>6,}  "
+                user_str = f"{row['user']:>6,}{DOWN_ARROW:>2}"
+                block_str = f"{row['block_cost']:>13,}{DOWN_ARROW:>2}"
+                time_str = f"{row['time_ms']:>10.1f}  "
+
+                print(f"{slot_str:<26} | {txns_str} | {votes_str} | {user_str} | {block_str} | {time_str} | {format_lamports(row['total_fee']):>14} | {format_lamports(row['priority_fee']):>14}")
             else:
-                t_ind = get_indicator(row["txns"], avg_txns)
-                v_ind = get_indicator(row["votes"], avg_votes)
-                u_ind = get_indicator(row["user"], avg_user)
-                b_ind = get_indicator(row["block_cost"], avg_block_cost)
-                tm_ind = get_indicator(row["time_ms"], avg_time_ms)
+                t_ind = get_indicator(row["txns"], median_txns)
+                v_ind = get_indicator(row["votes"], median_votes)
+                u_ind = get_indicator(row["user"], median_user)
+                b_ind = get_indicator(row["block_cost"], median_block_cost)
+                tm_ind = get_indicator(row["time_ms"], median_time_ms)
 
                 txns_str = f"{row['txns']:>6,}{t_ind:>2}"
                 votes_str = f"{row['votes']:>6,}{v_ind:>2}"
@@ -486,14 +542,14 @@ def analyze_logs(line_source, source_name):
                 print(f"{row['slot']:<26} | {txns_str} | {votes_str} | {user_str} | {block_str} | {time_str} | {format_lamports(row['total_fee']):>14} | {format_lamports(row['priority_fee']):>14}")
 
         print("-" * LEADER_TABLE_WIDTH)
-        # Calculate average fees
-        avg_total_fee = total_total_fee / slot_count if slot_count > 0 else 0
-        avg_priority_fee = total_priority_fee / slot_count if slot_count > 0 else 0
+        # Calculate median fees
+        median_total_fee = get_median([r["total_fee"] for r in slot_rows if not r.get("skipped")])
+        median_priority_fee = get_median([r["priority_fee"] for r in slot_rows if not r.get("skipped")])
 
         print(f"{'TOTAL':<26} | {total_txns:>8,} | {total_votes:>8,} | {total_user:>8,} | {total_block_cost:>15,} |              | {format_lamports(total_total_fee):>14} | {format_lamports(total_priority_fee):>14}")
         slots_label = f"({slot_count} produced, {skipped_count} skipped)"
         print(f"{slots_label:<26} |          |          |          |                 |              |                |")
-        print(f"{'AVERAGE':<26} | {avg_txns:>8,.0f} | {avg_votes:>8,.0f} | {avg_user:>8,.0f} | {avg_block_cost:>15,.0f} | {avg_time_ms:>12.1f} | {format_lamports(avg_total_fee):>14} | {format_lamports(avg_priority_fee):>14}")
+        print(f"{'MEDIAN':<26} | {median_txns:>8,.0f} | {median_votes:>8,.0f} | {median_user:>8,.0f} | {median_block_cost:>15,.0f} | {median_time_ms:>12.1f} | {format_lamports(median_total_fee):>14} | {format_lamports(median_priority_fee):>14}")
         print("=" * LEADER_TABLE_WIDTH)
     else:
         print("No leader slot data found in logs.")
@@ -511,8 +567,7 @@ def analyze_logs(line_source, source_name):
         print(f"Overall send rate: {total_pct:.1f}%")
 
         if total_periods > 1:
-            avg_bundles = total_bundles / total_periods
-            print(f"Average bundles per leader period: {avg_bundles:,.0f}")
+            print(f"Median bundles per leader period: {median_bundles:,.0f}")
 
         # Failure stats
         total_failures = total_scheduler_fail + total_outbound_fail
@@ -541,13 +596,16 @@ def analyze_logs(line_source, source_name):
         if skipped_count > 0:
             skip_rate = (skipped_count / (slot_count + skipped_count)) * 100
             print(f"  Skip rate: {skip_rate:.2f}%")
+        if small_block_count > 0:
+            small_block_pct = (small_block_count / slot_count) * 100 if slot_count > 0 else 0
+            print(f"  Small blocks: {small_block_count} ({small_block_pct:.1f}%) {SMALL_BLOCK_MARKER}")
         print(f"  Total transactions: {total_txns:,} ({total_votes:,} votes, {total_user:,} user)")
         print(f"  Total compute units: {total_block_cost:,}")
         print(f"  Total fees: {format_lamports(total_total_fee)} SOL")
         print(f"  Total priority fees: {format_lamports(total_priority_fee)} SOL")
         if slot_count > 0:
-            print(f"  Avg transactions per slot: {total_txns // slot_count:,}")
-            print(f"  Avg block time: {avg_time_ms:.1f} ms")
+            print(f"  Median transactions per slot: {median_txns:,.0f}")
+            print(f"  Median block time: {median_time_ms:.1f} ms")
 
 def verify_log_file(log_file):
     """Check if log file exists and is readable"""

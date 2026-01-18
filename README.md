@@ -89,14 +89,17 @@ Skipped slots (announced but not produced) are shown inline with "SKIPPED" in th
 
 ### Outlier Indicators
 
-Values that are significantly above or below average are marked with indicators:
+Values that are significantly above or below median are marked with indicators:
 
 | Indicator | Meaning |
 |-----------|---------|
-| ▲ | Value is more than 20% above average |
-| ▼ | Value is more than 20% below average |
+| ▲ | Value is more than 20% above median |
+| ▼ | Value is more than 20% below median |
+| ◆ | Small block (user txns AND block CUs both below 25% of median) |
 
 These indicators appear on: Bundles, Results Sent, Txns, Votes, User, Block CUs, and Time (ms) columns.
+
+Small blocks are slots where minimal useful work was done (e.g., mostly vote transactions with very few user transactions). These are marked with ◆ after the slot number and counted separately in the summary.
 
 ## Sample Output
 
@@ -113,7 +116,7 @@ Time (UTC)           | Slot Range                |      Bundles |   Results Sent
 ...
 ---------------------------------------------------------------------------------------------------
 TOTAL                | 22 periods                |      102,927 |        102,927 |   100.0%
-(average)            |                           |        4,678 |          4,678 |
+(median)             |                           |        4,678 |          4,678 |
 ===================================================================================================
 
 ====================================================================LEADER SLOT METRICS=====================================================================
@@ -121,11 +124,12 @@ Slot                       |     Txns |    Votes |     User |       Block CUs | 
 ------------------------------------------------------------------------------------------------------------------------------------------------------------
 393779592                  |  1,314   |    778   |    536   |    45,354,622   |      345.2   |       0.021618 |       0.014393
 393779593                  |  1,072   |    787   |    285 ▼ |    23,140,917 ▼ |      288.7   |       0.013247 |       0.007582
+393779594 ◆                |    769 ▼ |    769   |      0 ▼ |     2,636,132 ▼ |      301.4   |       0.003860 |    0.000000000
 ...
 ------------------------------------------------------------------------------------------------------------------------------------------------------------
 TOTAL                      |  116,108 |   72,354 |   43,754 |   3,802,340,772 |              |         3.0066 |         2.3771
 (92 produced, 0 skipped)   |          |          |          |                 |              |                |
-AVERAGE                    |    1,262 |      786 |      476 |      41,329,791 |        311.0 |       0.032681 |       0.025838
+MEDIAN                     |    1,262 |      786 |      476 |      41,329,791 |        311.0 |       0.032681 |       0.025838
 ============================================================================================================================================================
 
 Time range: 2026-01-16 01:20 to 2026-01-16 15:40 UTC
@@ -133,7 +137,7 @@ Leader periods: 22
 Total bundles received: 102,927
 Total bundle results sent: 102,927
 Overall send rate: 100.0%
-Average bundles per leader period: 4,678
+Median bundles per leader period: 4,678
 
 No failures detected.
 
@@ -145,12 +149,13 @@ Connection health:
 Leader slot summary:
   Slots produced: 92
   Slots skipped: 0
+  Small blocks: 2 (2.2%) ◆
   Total transactions: 116,108 (72,354 votes, 43,754 user)
   Total compute units: 3,802,340,772
   Total fees: 3.0066 SOL
   Total priority fees: 2.3771 SOL
-  Avg transactions per slot: 1,262
-  Avg block time: 311.0 ms
+  Median transactions per slot: 1,262
+  Median block time: 311.0 ms
 ```
 
 ## Requirements
