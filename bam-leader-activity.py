@@ -8,6 +8,7 @@ Produces a table showing when bundles were received during leader slots.
 Supports reading from a log file or from journalctl.
 """
 
+import os
 import re
 import sys
 import subprocess
@@ -17,11 +18,15 @@ from datetime import datetime
 # =============================================================================
 # CONFIGURATION - Set your defaults here
 # =============================================================================
-VALIDATOR_LOG = "/home/sol/logs/validator.log"
-SERVICE_NAME = "sol.service"
+DEFAULT_LOG_PATH = os.path.expanduser("~/logs/validator.log")
+DEFAULT_SERVICE = "sol.service"
 
 # Vote transaction cost from solana source: SIMPLE_VOTE_USAGE_COST
 VOTE_CU_COST = 3428
+
+# Table separator widths (based on column formats)
+BAM_TABLE_WIDTH = 91
+LEADER_TABLE_WIDTH = 126
 # =============================================================================
 
 def parse_timestamp(line):
@@ -41,10 +46,10 @@ def print_usage():
     print(f"""BAM Leader Slot Activity Analyzer
 
 Usage:
-  {sys.argv[0]}                      Use default log file ({VALIDATOR_LOG})
+  {sys.argv[0]}                      Use default log file ({DEFAULT_LOG_PATH})
   {sys.argv[0]} /path/to/file.log    Read from specified log file
-  {sys.argv[0]} -j [service]         Read from journalctl (default: {SERVICE_NAME})
-  {sys.argv[0]} --journal [service]  Read from journalctl (default: {SERVICE_NAME})
+  {sys.argv[0]} -j [service]         Read from journalctl (default: {DEFAULT_SERVICE})
+  {sys.argv[0]} --journal [service]  Read from journalctl (default: {DEFAULT_SERVICE})
 
 Examples:
   {sys.argv[0]}                      # Use default log file
@@ -334,9 +339,9 @@ def analyze_logs(line_source, source_name):
         avg_bundles = total_bundles / total_periods if total_periods > 0 else 0
         avg_results = total_results / total_periods if total_periods > 0 else 0
 
-        print(f"{'BAM BUNDLE ACTIVITY':=^99}")
+        print(f"{'BAM BUNDLE ACTIVITY':=^{BAM_TABLE_WIDTH}}")
         print(f"{'Time (UTC)':<20} | {'Slot Range':<25} | {'Bundles':>12} | {'Results Sent':>14} | {'% Sent':>8}")
-        print("-" * 99)
+        print("-" * BAM_TABLE_WIDTH)
 
         for row in bundle_rows:
             b_ind = get_indicator(row["bundles"], avg_bundles)
@@ -346,12 +351,12 @@ def analyze_logs(line_source, source_name):
             print(f"{row['minute']:<20} | {row['slot_range']:<25} | {bundles_str} | {results_str} | {row['pct_sent']:>7.1f}%")
 
         # Print summary
-        print("-" * 99)
+        print("-" * BAM_TABLE_WIDTH)
         periods_str = f"{total_periods} periods"
         total_pct = (total_results / total_bundles * 100) if total_bundles > 0 else 0
         print(f"{'TOTAL':<20} | {periods_str:<25} | {total_bundles:>12,} | {total_results:>14,} | {total_pct:>7.1f}%")
         print(f"{'(average)':<20} | {'':<25} | {avg_bundles:>12,.0f} | {avg_results:>14,.0f} |")
-        print("=" * 99)
+        print("=" * BAM_TABLE_WIDTH)
 
         # Print failures table if any failures occurred
         total_failures = total_scheduler_fail + total_outbound_fail
@@ -359,9 +364,9 @@ def analyze_logs(line_source, source_name):
             fail_minutes = sorted([m for m, d in bundle_data.items()
                                   if d["scheduler_fail"] > 0 or d["outbound_fail"] > 0])
 
-            print(f"\n{'FAILURES DETECTED':=^99}")
+            print(f"\n{'FAILURES DETECTED':=^{BAM_TABLE_WIDTH}}")
             print(f"{'Time (UTC)':<20} | {'Slot Range':<25} | {'Sched Fail':>12} | {'Outbound Fail':>14} | {'Total':>8}")
-            print("-" * 99)
+            print("-" * BAM_TABLE_WIDTH)
 
             for minute in fail_minutes:
                 data = bundle_data[minute]
@@ -378,11 +383,12 @@ def analyze_logs(line_source, source_name):
 
                 print(f"{minute:<20} | {slot_range:<25} | {sched_fail:>12,} | {out_fail:>14,} | {total_min_fail:>8,}")
 
-            print("-" * 99)
+            print("-" * BAM_TABLE_WIDTH)
             print(f"{'TOTAL FAILURES':<20} | {'':<25} | {total_scheduler_fail:>12,} | {total_outbound_fail:>14,} | {total_failures:>8,}")
-            print("=" * 99)
+            print("=" * BAM_TABLE_WIDTH)
     else:
-        print("No BAM bundle activity found.\n")
+        print("No BAM bundle activity found.")
+        print("This validator does not appear to be running BAM (Block Assembly Marketplace).\n")
 
     # Print Leader Slot Metrics table
     if leader_slot_metrics or leader_slots_announced:
@@ -457,9 +463,9 @@ def analyze_logs(line_source, source_name):
         avg_time_ms = (total_time_us / slot_count / 1000) if slot_count > 0 else 0
 
         # Print table with indicators
-        print(f"\n{'LEADER SLOT METRICS':=^156}")
+        print(f"\n{'LEADER SLOT METRICS':=^{LEADER_TABLE_WIDTH}}")
         print(f"{'Slot':<26} | {'Txns':>8} | {'Votes':>8} | {'User':>8} | {'Block CUs':>15} | {'Time (ms)':>12} | {'Total Fee':>14} | {'Priority Fee':>14}")
-        print("-" * 156)
+        print("-" * LEADER_TABLE_WIDTH)
 
         for row in slot_rows:
             if row["skipped"]:
@@ -479,7 +485,7 @@ def analyze_logs(line_source, source_name):
 
                 print(f"{row['slot']:<26} | {txns_str} | {votes_str} | {user_str} | {block_str} | {time_str} | {format_lamports(row['total_fee']):>14} | {format_lamports(row['priority_fee']):>14}")
 
-        print("-" * 156)
+        print("-" * LEADER_TABLE_WIDTH)
         # Calculate average fees
         avg_total_fee = total_total_fee / slot_count if slot_count > 0 else 0
         avg_priority_fee = total_priority_fee / slot_count if slot_count > 0 else 0
@@ -488,10 +494,11 @@ def analyze_logs(line_source, source_name):
         slots_label = f"({slot_count} produced, {skipped_count} skipped)"
         print(f"{slots_label:<26} |          |          |          |                 |              |                |")
         print(f"{'AVERAGE':<26} | {avg_txns:>8,.0f} | {avg_votes:>8,.0f} | {avg_user:>8,.0f} | {avg_block_cost:>15,.0f} | {avg_time_ms:>12.1f} | {format_lamports(avg_total_fee):>14} | {format_lamports(avg_priority_fee):>14}")
-        print("=" * 156)
+        print("=" * LEADER_TABLE_WIDTH)
     else:
         print("No leader slot data found in logs.")
-        print("(Looking for 'cost_tracker_stats,is_leader=true' entries)\n")
+        print("This validator is not on the leader schedule for the log period.")
+        print("(This is expected for hot-standby validators.)\n")
 
     # Additional stats
     if active_minutes:
@@ -542,11 +549,57 @@ def analyze_logs(line_source, source_name):
             print(f"  Avg transactions per slot: {total_txns // slot_count:,}")
             print(f"  Avg block time: {avg_time_ms:.1f} ms")
 
+def verify_log_file(log_file):
+    """Check if log file exists and is readable"""
+    if not os.path.exists(log_file):
+        print(f"Error: Log file not found: {log_file}")
+        print(f"\nPlease specify a valid log file or use -j for journalctl.")
+        print(f"Run '{sys.argv[0]} --help' for usage information.")
+        sys.exit(1)
+    if not os.path.isfile(log_file):
+        print(f"Error: Not a file: {log_file}")
+        sys.exit(1)
+    if not os.access(log_file, os.R_OK):
+        print(f"Error: Permission denied: {log_file}")
+        sys.exit(1)
+
+def verify_journalctl_service(service):
+    """Check if journalctl is available and service has logs"""
+    # Check if journalctl exists
+    try:
+        subprocess.run(['which', 'journalctl'], capture_output=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("Error: journalctl not found. Is systemd installed?")
+        sys.exit(1)
+
+    # Check if service has any logs
+    if not service.endswith('.service'):
+        service_name = f"{service}.service"
+    else:
+        service_name = service
+
+    result = subprocess.run(
+        ['journalctl', '-u', service_name, '-n', '1', '--no-pager', '-o', 'cat'],
+        capture_output=True,
+        text=True
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        print(f"Error: No logs found for service: {service_name}")
+        print(f"\nCheck that the service name is correct and has log entries.")
+        print(f"Run '{sys.argv[0]} --help' for usage information.")
+        sys.exit(1)
+
 def main():
     # Parse arguments
     if len(sys.argv) == 1:
-        # No arguments - use default log file
-        analyze_logs(get_lines_from_file(VALIDATOR_LOG), VALIDATOR_LOG)
+        # No arguments - use default log file if it exists
+        if not os.path.exists(DEFAULT_LOG_PATH):
+            print(f"Error: Default log file not found: {DEFAULT_LOG_PATH}")
+            print(f"\nPlease specify a log file path or use -j for journalctl.")
+            print(f"Run '{sys.argv[0]} --help' for usage information.")
+            sys.exit(1)
+        verify_log_file(DEFAULT_LOG_PATH)
+        analyze_logs(get_lines_from_file(DEFAULT_LOG_PATH), DEFAULT_LOG_PATH)
 
     elif sys.argv[1] in ['-h', '--help']:
         print_usage()
@@ -554,21 +607,16 @@ def main():
 
     elif sys.argv[1] in ['-j', '--journal']:
         # Use journalctl
-        if len(sys.argv) > 2:
-            service = sys.argv[2]
-        else:
-            service = SERVICE_NAME
+        service = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_SERVICE
+        display_name = service if service.endswith('.service') else f"{service}.service"
 
-        if not service.endswith('.service'):
-            display_name = f"{service}.service"
-        else:
-            display_name = service
-
+        verify_journalctl_service(service)
         analyze_logs(get_lines_from_journalctl(service), f"journalctl -u {display_name}")
 
     else:
         # Assume it's a log file path
         log_file = sys.argv[1]
+        verify_log_file(log_file)
         analyze_logs(get_lines_from_file(log_file), log_file)
 
 if __name__ == "__main__":
