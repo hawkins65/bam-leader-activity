@@ -235,4 +235,14 @@ Bundle activity only occurs during your validator's leader slots, so this effect
 | Vote transactions | `vote_cost / 3428` (SIMPLE_VOTE_USAGE_COST from Solana source) |
 | User transactions | `transaction_count - vote_transactions` |
 | Block time (ms) | `slot_broadcast_time / 1000` |
-| Skipped slots | Slots in `replay_stage-my_leader_slot` but not in `cost_tracker_stats` |
+| Skipped slots | Slots announced in `replay_stage-my_leader_slot` but missing from `cost_tracker_stats` |
+| Small blocks | Slots where user txns AND block CUs are both below 25% of median |
+
+### Skipped Slot Detection
+
+Skipped slots are detected by comparing two sets of data:
+
+1. **Announced slots** - collected from `replay_stage-my_leader_slot` log entries, which indicate when the validator is scheduled to be leader
+2. **Produced slots** - collected from `cost_tracker_stats,is_leader=true` log entries, which are only emitted when a block is actually produced
+
+A slot is marked as **skipped** if it appears in the announced set but not in the produced set. This happens when the validator was scheduled to lead but failed to produce a block (due to timing issues, fork choice, etc.).
