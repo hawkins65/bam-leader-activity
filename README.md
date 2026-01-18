@@ -154,7 +154,8 @@ Leader slot summary:
   Total compute units: 3,802,340,772
   Total fees: 3.0066 SOL
   Total priority fees: 2.3771 SOL
-  Median transactions per slot: 1,262
+  Per-block median: 1,262 txns (786 votes, 476 user), 41,329,791 CUs
+  Per-block median: 0.032681 SOL fees, 0.025838 SOL priority
   Median block time: 311.0 ms
 ```
 

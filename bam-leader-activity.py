@@ -604,7 +604,8 @@ def analyze_logs(line_source, source_name):
         print(f"  Total fees: {format_lamports(total_total_fee)} SOL")
         print(f"  Total priority fees: {format_lamports(total_priority_fee)} SOL")
         if slot_count > 0:
-            print(f"  Median transactions per slot: {median_txns:,.0f}")
+            print(f"  Per-block median: {median_txns:,.0f} txns ({median_votes:,.0f} votes, {median_user:,.0f} user), {median_block_cost:,.0f} CUs")
+            print(f"  Per-block median: {format_lamports(median_total_fee)} SOL fees, {format_lamports(median_priority_fee)} SOL priority")
             print(f"  Median block time: {median_time_ms:.1f} ms")
 
 def verify_log_file(log_file):
