@@ -20,6 +20,7 @@ from datetime import datetime
 # =============================================================================
 DEFAULT_LOG_PATH = os.path.expanduser("~/logs/validator.log")
 DEFAULT_SERVICE = "sol.service"
+DEFAULT_HOURS = 24  # Default time span for journalctl
 
 # Vote transaction cost from solana source: SIMPLE_VOTE_USAGE_COST
 VOTE_CU_COST = 3428
@@ -48,14 +49,17 @@ def print_usage():
 Usage:
   {sys.argv[0]}                      Use default log file ({DEFAULT_LOG_PATH})
   {sys.argv[0]} /path/to/file.log    Read from specified log file
-  {sys.argv[0]} -j [service]         Read from journalctl (default: {DEFAULT_SERVICE})
-  {sys.argv[0]} --journal [service]  Read from journalctl (default: {DEFAULT_SERVICE})
+  {sys.argv[0]} -j [service]         Read from journalctl (default: {DEFAULT_SERVICE}, last {DEFAULT_HOURS}h)
+  {sys.argv[0]} --journal [service]  Read from journalctl (default: {DEFAULT_SERVICE}, last {DEFAULT_HOURS}h)
+  {sys.argv[0]} --hours N            Set time span for journalctl (default: {DEFAULT_HOURS})
 
 Examples:
   {sys.argv[0]}                      # Use default log file
   {sys.argv[0]} /var/log/solana.log  # Use specific log file
-  {sys.argv[0]} -j                   # Use journalctl with default service
+  {sys.argv[0]} -j                   # Use journalctl with default service (last {DEFAULT_HOURS}h)
   {sys.argv[0]} -j myvalidator       # Use journalctl with myvalidator.service
+  {sys.argv[0]} -j --hours 48        # Use journalctl, last 48 hours
+  {sys.argv[0]} -j sol --hours 12    # Use journalctl for sol.service, last 12 hours
 """)
 
 def get_lines_from_file(log_file):
@@ -71,12 +75,14 @@ def get_lines_from_file(log_file):
         print(f"Error: Permission denied: {log_file}")
         sys.exit(1)
 
-def get_lines_from_journalctl(service):
+def get_lines_from_journalctl(service, hours=None):
     """Generator that yields lines from journalctl for a service"""
     if not service.endswith('.service'):
         service = f"{service}.service"
 
     cmd = ['journalctl', '-u', service, '--no-pager', '-o', 'cat']
+    if hours is not None:
+        cmd.extend(['--since', f'{hours} hours ago'])
 
     try:
         process = subprocess.Popen(
@@ -650,7 +656,21 @@ def verify_journalctl_service(service):
 
 def main():
     # Parse arguments
-    if len(sys.argv) == 1:
+    args = sys.argv[1:]
+
+    # Extract --hours if present
+    hours = DEFAULT_HOURS
+    if '--hours' in args:
+        try:
+            hours_idx = args.index('--hours')
+            hours = int(args[hours_idx + 1])
+            args = args[:hours_idx] + args[hours_idx + 2:]
+        except (IndexError, ValueError):
+            print("Error: --hours requires a numeric value")
+            print(f"Run '{sys.argv[0]} --help' for usage information.")
+            sys.exit(1)
+
+    if len(args) == 0:
         # No arguments - use default log file if it exists
         if not os.path.exists(DEFAULT_LOG_PATH):
             print(f"Error: Default log file not found: {DEFAULT_LOG_PATH}")
@@ -660,21 +680,21 @@ def main():
         verify_log_file(DEFAULT_LOG_PATH)
         analyze_logs(get_lines_from_file(DEFAULT_LOG_PATH), DEFAULT_LOG_PATH)
 
-    elif sys.argv[1] in ['-h', '--help']:
+    elif args[0] in ['-h', '--help']:
         print_usage()
         sys.exit(0)
 
-    elif sys.argv[1] in ['-j', '--journal']:
+    elif args[0] in ['-j', '--journal']:
         # Use journalctl
-        service = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_SERVICE
+        service = args[1] if len(args) > 1 else DEFAULT_SERVICE
         display_name = service if service.endswith('.service') else f"{service}.service"
 
         verify_journalctl_service(service)
-        analyze_logs(get_lines_from_journalctl(service), f"journalctl -u {display_name}")
+        analyze_logs(get_lines_from_journalctl(service, hours), f"journalctl -u {display_name} (last {hours}h)")
 
     else:
         # Assume it's a log file path
-        log_file = sys.argv[1]
+        log_file = args[0]
         verify_log_file(log_file)
         analyze_logs(get_lines_from_file(log_file), log_file)
 

@@ -12,10 +12,11 @@ Analyzes Solana validator logs to correlate BAM (Block Assembly Marketplace) bun
 
 | Option | Description |
 |--------|-------------|
-| (none) | Use default log file (set via `VALIDATOR_LOG` in script) |
+| (none) | Use default log file (set via `DEFAULT_LOG_PATH` in script) |
 | `/path/to/file.log` | Read from specified log file |
 | `-j [service]` | Read from journalctl using specified service (default: `sol.service`) |
 | `--journal [service]` | Same as `-j` |
+| `--hours N` | Time span for journalctl in hours (default: 24) |
 | `-h` | Show help message |
 | `--help` | Same as `-h` |
 
@@ -28,12 +29,17 @@ Analyzes Solana validator logs to correlate BAM (Block Assembly Marketplace) bun
 # Use a specific log file
 ./bam-leader-activity.py /home/sol/logs/validator.log
 
-# Read from journalctl with default service (sol.service)
+# Read from journalctl with default service (sol.service), last 24 hours
 ./bam-leader-activity.py -j
 
 # Read from journalctl with a specific service
 ./bam-leader-activity.py -j myvalidator
 ./bam-leader-activity.py --journal agave
+
+# Read from journalctl with custom time span
+./bam-leader-activity.py -j --hours 48        # Last 48 hours
+./bam-leader-activity.py -j sol --hours 12    # sol.service, last 12 hours
+./bam-leader-activity.py -j --hours 6         # Last 6 hours
 
 # Show help
 ./bam-leader-activity.py -h
@@ -45,9 +51,10 @@ Analyzes Solana validator logs to correlate BAM (Block Assembly Marketplace) bun
 Edit the variables at the top of the script to set your defaults:
 
 ```python
-VALIDATOR_LOG = "/home/sol/logs/validator.log"  # Default log file path
-SERVICE_NAME = "sol.service"                     # Default systemd service name
-VOTE_CU_COST = 3428                              # Vote transaction CU cost (from Solana source)
+DEFAULT_LOG_PATH = "~/logs/validator.log"  # Default log file path
+DEFAULT_SERVICE = "sol.service"            # Default systemd service name
+DEFAULT_HOURS = 24                         # Default time span for journalctl (hours)
+VOTE_CU_COST = 3428                        # Vote transaction CU cost (from Solana source)
 ```
 
 ## Output
@@ -171,10 +178,11 @@ Leader slot summary:
 Reads directly from a validator log file. This is typically faster and works with rotated/archived logs.
 
 ### Journalctl Mode (-j)
-Reads from systemd journal. Useful when:
+Reads from systemd journal. By default, analyzes the last 24 hours of logs (configurable with `--hours`). Useful when:
 - Validator logs to systemd journal instead of a file
 - You want to analyze logs without knowing the exact file path
 - Log files are not persisted to disk
+- You want to limit analysis to a specific time window
 
 Note: If your validator uses `--log /path/to/file` in its startup command, logs go to that file, not journalctl.
 
