@@ -125,7 +125,7 @@ Usage:
 
 Options:
   --verbose                          Show all connection events (not just state changes)
-  --no-metrics                       Skip per-minute health metrics table
+  --metrics                          Show per-minute health metrics table (hidden by default)
   --bam-url URL                      Check ping latency to BAM host (extracts hostname from URL)
   --startup-script PATH              Path to validator startup script to extract --bam-url
                                      (default: {DEFAULT_STARTUP_SCRIPT})
@@ -654,7 +654,7 @@ def main():
     # Extract options
     hours = DEFAULT_HOURS
     verbose = False
-    show_metrics = True
+    show_metrics = False
     bam_url = None
     startup_script = DEFAULT_STARTUP_SCRIPT
     no_ping = False
@@ -694,9 +694,9 @@ def main():
         verbose = True
         args.remove('--verbose')
 
-    if '--no-metrics' in args:
-        show_metrics = False
-        args.remove('--no-metrics')
+    if '--metrics' in args:
+        show_metrics = True
+        args.remove('--metrics')
 
     # Auto-detect bam_url from startup script if not explicitly provided
     if not bam_url and not no_ping:

@@ -18,7 +18,7 @@ Monitors BAM (Block Assembly Marketplace) connection status from Solana validato
 | `--journal [service]` | Same as `-j` |
 | `--hours N` | Time span for journalctl in hours (default: 24) |
 | `--verbose` | Show all connection events (not just state changes) |
-| `--no-metrics` | Skip per-minute health metrics table |
+| `--metrics` | Show per-minute health metrics table (hidden by default) |
 | `--bam-url URL` | Check ping latency to BAM host (extracts hostname from URL) |
 | `--startup-script PATH` | Path to validator startup script to extract `--bam-url` (default: `~/validator.sh`) |
 | `--no-ping` | Skip automatic BAM host ping check |
@@ -42,8 +42,8 @@ Monitors BAM (Block Assembly Marketplace) connection status from Solana validato
 # Show all events (including info-level)
 ./bam-connectivity.py -j --verbose
 
-# Skip the per-minute metrics table
-./bam-connectivity.py -j --no-metrics
+# Show the per-minute metrics table
+./bam-connectivity.py -j --metrics
 
 # Override BAM URL for latency check
 ./bam-connectivity.py -j --bam-url wss://ny.mainnet.block.engine.jito.wtf
@@ -128,6 +128,8 @@ Minutes with unhealthy events are highlighted.
 - Overall status: HEALTHY / MOSTLY HEALTHY / ISSUES DETECTED
 
 ## Sample Output
+
+Example output with `--metrics` flag:
 
 ```
 Detected --bam-url from /home/sol/validator.sh: wss://ny.mainnet.block.engine.jito.wtf
