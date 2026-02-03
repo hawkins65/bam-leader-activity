@@ -19,12 +19,15 @@ Monitors BAM (Block Assembly Marketplace) connection status from Solana validato
 | `--hours N` | Time span for journalctl in hours (default: 24) |
 | `--verbose` | Show all connection events (not just state changes) |
 | `--no-metrics` | Skip per-minute health metrics table |
+| `--bam-url URL` | Check ping latency to BAM host (extracts hostname from URL) |
+| `--startup-script PATH` | Path to validator startup script to extract `--bam-url` (default: `~/validator.sh`) |
+| `--no-ping` | Skip automatic BAM host ping check |
 | `-h`, `--help` | Show help message |
 
 ## Examples
 
 ```bash
-# Use default log file
+# Use default log file (auto-detects BAM URL from ~/validator.sh)
 ./bam-connectivity.py
 
 # Use a specific log file
@@ -41,6 +44,15 @@ Monitors BAM (Block Assembly Marketplace) connection status from Solana validato
 
 # Skip the per-minute metrics table
 ./bam-connectivity.py -j --no-metrics
+
+# Override BAM URL for latency check
+./bam-connectivity.py -j --bam-url wss://ny.mainnet.block.engine.jito.wtf
+
+# Use a systemd service file to extract BAM URL
+./bam-connectivity.py -j --startup-script /etc/systemd/system/sol.service
+
+# Skip latency check entirely
+./bam-connectivity.py -j --no-ping
 ```
 
 ## Configuration
@@ -51,7 +63,35 @@ Edit the variables at the top of the script to set your defaults:
 DEFAULT_LOG_PATH = "~/logs/validator.log"  # Default log file path
 DEFAULT_SERVICE = "sol.service"            # Default systemd service name
 DEFAULT_HOURS = 24                         # Default time span for journalctl (hours)
+DEFAULT_STARTUP_SCRIPT = "~/validator.sh"  # Validator startup script for BAM URL detection
 ```
+
+## BAM URL Auto-Detection
+
+The script automatically extracts the `--bam-url` from your validator startup script to check network latency. By default, it looks for `~/validator.sh`.
+
+**Supported formats:**
+- Shell scripts: `--bam-url <value>` or `--bam-url=<value>`
+- Multi-line scripts with backslash continuations
+- Systemd service files (same patterns in ExecStart)
+
+If the default startup script doesn't exist, you can:
+1. Edit `DEFAULT_STARTUP_SCRIPT` at the top of the script
+2. Use `--startup-script /path/to/your/script`
+3. Use `--bam-url` to specify the URL directly
+4. Use `--no-ping` to skip latency checking
+
+## Network Latency Check
+
+The script pings the BAM host and reports latency with color-coded output:
+
+| Latency | Status | Meaning |
+|---------|--------|---------|
+| < 20ms | Good (green) | Optimal connectivity |
+| 20-35ms | Moderate (yellow) | Acceptable but not ideal |
+| > 35ms | High (red) | **Likely cause of connectivity issues** |
+
+High latency (>35ms) to the BAM node is often the smoking gun for connection problems, dropped bundles, or unhealthy connection warnings.
 
 ## Output
 
@@ -90,6 +130,8 @@ Minutes with unhealthy events are highlighted.
 ## Sample Output
 
 ```
+Detected --bam-url from /home/sol/validator.sh: wss://ny.mainnet.block.engine.jito.wtf
+
 Analyzing: journalctl -u sol.service (last 24h)
 Processing logs.............. done (5,234,567 lines)
 
@@ -115,6 +157,9 @@ TOTAL                |       28,560 |          3 |      4,521 |          0
 ====================================================================================================
 
 ============================================SUMMARY=================================================
+BAM host: ny.mainnet.block.engine.jito.wtf
+Checking network latency... 12.3ms (good)
+
 Time range: 2026-01-20 08:15:23 to 2026-01-20 22:45:12 (14.5h)
 
 Connection events:
@@ -193,7 +238,8 @@ The validator does not have `--bam-url` configured. To enable BAM:
 
 ### High unhealthy count
 
-- Check network connectivity to BAM node
+- Check network latency to BAM node (script shows this automatically)
+- **If latency > 35ms**: This is likely the cause - consider using a BAM node closer to your validator
 - Verify BAM node URL is correct
 - Check if BAM node is operational
 

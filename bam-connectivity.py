@@ -14,6 +14,7 @@ import sys
 import subprocess
 from collections import defaultdict
 from datetime import datetime
+from urllib.parse import urlparse
 
 # =============================================================================
 # CONFIGURATION
@@ -21,6 +22,7 @@ from datetime import datetime
 DEFAULT_LOG_PATH = os.path.expanduser("~/logs/validator.log")
 DEFAULT_SERVICE = "sol.service"
 DEFAULT_HOURS = 24
+DEFAULT_STARTUP_SCRIPT = os.path.expanduser("~/validator.sh")
 
 # Table widths
 TABLE_WIDTH = 100
@@ -40,6 +42,76 @@ def parse_timestamp(line):
     return None, None
 
 
+def ping_host(host, count=5):
+    """Ping a host and return average latency in ms, or None if failed"""
+    try:
+        result = subprocess.run(
+            ['ping', '-c', str(count), '-W', '2', host],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        if result.returncode == 0:
+            # Parse avg from: rtt min/avg/max/mdev = 1.234/2.345/3.456/0.123 ms
+            match = re.search(r'rtt min/avg/max/mdev = [\d.]+/([\d.]+)/', result.stdout)
+            if match:
+                return float(match.group(1))
+        return None
+    except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+        return None
+
+
+def extract_hostname_from_url(url):
+    """Extract hostname from a URL"""
+    if not url:
+        return None
+    # Add scheme if missing for urlparse
+    if not url.startswith(('http://', 'https://', 'ws://', 'wss://')):
+        url = 'https://' + url
+    parsed = urlparse(url)
+    return parsed.hostname
+
+
+def extract_bam_url_from_script(script_path):
+    """
+    Extract --bam-url value from a validator startup script or systemd service file.
+
+    Supports:
+    - Shell scripts: --bam-url <value> or --bam-url=<value>
+    - Systemd service files: same patterns within ExecStart or similar
+
+    Returns (bam_url, error_message) tuple. If successful, error_message is None.
+    """
+    script_path = os.path.expanduser(script_path)
+
+    if not os.path.exists(script_path):
+        return None, f"Startup script not found: {script_path}"
+
+    if not os.access(script_path, os.R_OK):
+        return None, f"Cannot read startup script: {script_path}"
+
+    try:
+        with open(script_path, 'r', errors='replace') as f:
+            content = f.read()
+    except Exception as e:
+        return None, f"Error reading {script_path}: {e}"
+
+    # Pattern 1: --bam-url=<value> (no space, with equals)
+    match = re.search(r'--bam-url[=\s]+([^\s\\]+)', content)
+    if match:
+        url = match.group(1).strip('"\'')
+        return url, None
+
+    # Pattern 2: --bam-url on one line, value on next (common in multi-line shell scripts)
+    # Look for --bam-url followed by backslash-newline, then the value
+    match = re.search(r'--bam-url\s*\\\s*\n\s*([^\s\\]+)', content)
+    if match:
+        url = match.group(1).strip('"\'')
+        return url, None
+
+    return None, f"No --bam-url found in {script_path}"
+
+
 def print_usage():
     print(f"""BAM Connectivity Status Monitor
 
@@ -54,11 +126,20 @@ Usage:
 Options:
   --verbose                          Show all connection events (not just state changes)
   --no-metrics                       Skip per-minute health metrics table
+  --bam-url URL                      Check ping latency to BAM host (extracts hostname from URL)
+  --startup-script PATH              Path to validator startup script to extract --bam-url
+                                     (default: {DEFAULT_STARTUP_SCRIPT})
+  --no-ping                          Skip automatic BAM host ping check
+
+The script automatically extracts --bam-url from the startup script ({DEFAULT_STARTUP_SCRIPT})
+if it exists. Use --startup-script to specify an alternative path, or --bam-url to override.
 
 Examples:
-  {sys.argv[0]}                      # Use default log file
+  {sys.argv[0]}                      # Use default log file, auto-detect BAM URL
   {sys.argv[0]} -j --hours 4         # Last 4 hours from journalctl
   {sys.argv[0]} -j sol --verbose     # Show all events from sol.service
+  {sys.argv[0]} -j --bam-url wss://ny.mainnet.block.engine.jito.wtf  # Override BAM URL
+  {sys.argv[0]} -j --startup-script /etc/systemd/system/sol.service  # Use service file
 """)
 
 
@@ -122,7 +203,7 @@ def format_duration(seconds):
         return f"{hours:.1f}h"
 
 
-def analyze_logs(line_source, source_name, verbose=False, show_metrics=True):
+def analyze_logs(line_source, source_name, verbose=False, show_metrics=True, bam_url=None):
     """Analyze log lines for BAM connectivity status"""
 
     print(f"Analyzing: {source_name}")
@@ -336,6 +417,35 @@ def analyze_logs(line_source, source_name, verbose=False, show_metrics=True):
         print("This validator may not have --bam-url configured.")
         print("\nTo enable BAM, start the validator with:")
         print("  --bam-url <BAM_NODE_URL>")
+
+        # Still show ping check if we have a BAM URL - useful for troubleshooting
+        if bam_url:
+            hostname = extract_hostname_from_url(bam_url)
+            if hostname:
+                print(f"\n{'NETWORK CHECK':=^{TABLE_WIDTH}}")
+                print(f"BAM host: {hostname}")
+                print("Checking network latency...", end=" ", flush=True)
+                ping_ms = ping_host(hostname)
+                if ping_ms is not None:
+                    if ping_ms > 35:
+                        if sys.stdout.isatty():
+                            print(f"\033[91m{ping_ms:.1f}ms - HIGH LATENCY (>35ms)\033[0m")
+                            print(f"  \033[93m^ This may cause connectivity issues!\033[0m")
+                        else:
+                            print(f"{ping_ms:.1f}ms - HIGH LATENCY (>35ms) ** POSSIBLE ISSUE **")
+                    elif ping_ms > 20:
+                        if sys.stdout.isatty():
+                            print(f"\033[93m{ping_ms:.1f}ms\033[0m (moderate)")
+                        else:
+                            print(f"{ping_ms:.1f}ms (moderate)")
+                    else:
+                        if sys.stdout.isatty():
+                            print(f"\033[92m{ping_ms:.1f}ms\033[0m (good)")
+                        else:
+                            print(f"{ping_ms:.1f}ms (good)")
+                else:
+                    print("FAILED (host unreachable or ping blocked)")
+                print(f"{'=' * TABLE_WIDTH}")
         return
 
     # Print connection events timeline
@@ -411,6 +521,34 @@ def analyze_logs(line_source, source_name, verbose=False, show_metrics=True):
 
     # Print summary
     print(f"\n{'SUMMARY':=^{TABLE_WIDTH}}")
+
+    # Network latency check
+    if bam_url:
+        hostname = extract_hostname_from_url(bam_url)
+        if hostname:
+            print(f"BAM host: {hostname}")
+            print("Checking network latency...", end=" ", flush=True)
+            ping_ms = ping_host(hostname)
+            if ping_ms is not None:
+                if ping_ms > 35:
+                    if sys.stdout.isatty():
+                        print(f"\033[91m{ping_ms:.1f}ms - HIGH LATENCY (>35ms)\033[0m")
+                        print(f"  \033[93m^ This may cause connectivity issues!\033[0m")
+                    else:
+                        print(f"{ping_ms:.1f}ms - HIGH LATENCY (>35ms) ** POSSIBLE ISSUE **")
+                elif ping_ms > 20:
+                    if sys.stdout.isatty():
+                        print(f"\033[93m{ping_ms:.1f}ms\033[0m (moderate)")
+                    else:
+                        print(f"{ping_ms:.1f}ms (moderate)")
+                else:
+                    if sys.stdout.isatty():
+                        print(f"\033[92m{ping_ms:.1f}ms\033[0m (good)")
+                    else:
+                        print(f"{ping_ms:.1f}ms (good)")
+            else:
+                print("FAILED (host unreachable or ping blocked)")
+            print()
 
     # Time range
     if first_ts and last_ts:
@@ -517,6 +655,9 @@ def main():
     hours = DEFAULT_HOURS
     verbose = False
     show_metrics = True
+    bam_url = None
+    startup_script = DEFAULT_STARTUP_SCRIPT
+    no_ping = False
 
     if '--hours' in args:
         try:
@@ -527,6 +668,28 @@ def main():
             print("Error: --hours requires a numeric value")
             sys.exit(1)
 
+    if '--bam-url' in args:
+        try:
+            idx = args.index('--bam-url')
+            bam_url = args[idx + 1]
+            args = args[:idx] + args[idx + 2:]
+        except IndexError:
+            print("Error: --bam-url requires a URL value")
+            sys.exit(1)
+
+    if '--startup-script' in args:
+        try:
+            idx = args.index('--startup-script')
+            startup_script = args[idx + 1]
+            args = args[:idx] + args[idx + 2:]
+        except IndexError:
+            print("Error: --startup-script requires a path value")
+            sys.exit(1)
+
+    if '--no-ping' in args:
+        no_ping = True
+        args.remove('--no-ping')
+
     if '--verbose' in args:
         verbose = True
         args.remove('--verbose')
@@ -535,6 +698,22 @@ def main():
         show_metrics = False
         args.remove('--no-metrics')
 
+    # Auto-detect bam_url from startup script if not explicitly provided
+    if not bam_url and not no_ping:
+        detected_url, _ = extract_bam_url_from_script(startup_script)
+        if detected_url:
+            bam_url = detected_url
+            print(f"Detected --bam-url from {startup_script}: {bam_url}\n")
+        elif os.path.exists(os.path.expanduser(startup_script)):
+            # File exists but no --bam-url found
+            print(f"Note: No --bam-url found in {startup_script}")
+            print("      Use --bam-url to specify manually, or --no-ping to skip latency check\n")
+        else:
+            # Default startup script doesn't exist
+            print(f"Note: Startup script not found: {startup_script}")
+            print("      Update DEFAULT_STARTUP_SCRIPT in this script, use --startup-script,")
+            print("      or use --bam-url to specify the BAM URL manually\n")
+
     if len(args) == 0:
         if not os.path.exists(DEFAULT_LOG_PATH):
             print(f"Error: Default log file not found: {DEFAULT_LOG_PATH}")
@@ -542,7 +721,7 @@ def main():
             print(f"Run '{sys.argv[0]} --help' for usage information.")
             sys.exit(1)
         verify_log_file(DEFAULT_LOG_PATH)
-        analyze_logs(get_lines_from_file(DEFAULT_LOG_PATH), DEFAULT_LOG_PATH, verbose, show_metrics)
+        analyze_logs(get_lines_from_file(DEFAULT_LOG_PATH), DEFAULT_LOG_PATH, verbose, show_metrics, bam_url)
 
     elif args[0] in ['-h', '--help']:
         print_usage()
@@ -556,13 +735,14 @@ def main():
             get_lines_from_journalctl(service, hours),
             f"journalctl -u {display_name} (last {hours}h)",
             verbose,
-            show_metrics
+            show_metrics,
+            bam_url
         )
 
     else:
         log_file = args[0]
         verify_log_file(log_file)
-        analyze_logs(get_lines_from_file(log_file), log_file, verbose, show_metrics)
+        analyze_logs(get_lines_from_file(log_file), log_file, verbose, show_metrics, bam_url)
 
 
 if __name__ == "__main__":
