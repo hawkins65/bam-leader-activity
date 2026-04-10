@@ -28,10 +28,11 @@ from pathlib import Path
 
 VALIDATOR_LOG = Path.home() / "logs" / "validator.log"
 DISCORD_WEBHOOK_FILE = Path.home() / ".config" / "discord" / "webhook"
-BOT_USERNAME = "Validator Log Summary"
-BOT_AVATAR = "https://trillium.so/images/trillium-default.png"
+DISCORD_EMBED_SCRIPT = Path.home() / "999_discord_embed.sh"
+BOT_USERNAME = "BAM Hourly Summary"
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
 HOSTNAME = os.uname().nodename
+SCRIPT_PATH = f"{HOSTNAME}:{os.path.abspath(__file__)}"
 
 # ── BAM-specific patterns ─────────────────────────────────────────────────────
 
@@ -292,8 +293,45 @@ Be concise and validator-operator focused."""
         raise RuntimeError(f"Claude API error {e.code}: {body}") from e
 
 
-def send_discord_embed(summary: str, data: dict, hours: int, dry_run: bool) -> None:
-    """Post BAM summary to Discord."""
+def _call_discord_embed(severity: str, title: str, description: str,
+                        footer_extra: str = "", pagerduty: bool = False) -> bool:
+    """Send a Discord embed via the standard 999_discord_embed.sh script."""
+    if not DISCORD_EMBED_SCRIPT.exists():
+        log(f"ERROR: Discord embed script not found: {DISCORD_EMBED_SCRIPT}")
+        return False
+
+    # Use \n literals — the bash script converts them to real newlines
+    description = description.replace('\n', '\\n')
+
+    webhook = get_discord_webhook()
+    cmd = (
+        f'source "{DISCORD_EMBED_SCRIPT}" && '
+        f'send_discord_embed "{webhook}" "{severity}" '
+        f'"{title}" "{description}" '
+        f'username="{BOT_USERNAME}" '
+        f'script_path="{SCRIPT_PATH}"'
+    )
+    if footer_extra:
+        cmd += f' footer_extra="{footer_extra}"'
+    if not pagerduty:
+        cmd += ' pagerduty=false'
+
+    try:
+        result = subprocess.run(
+            ['bash', '-c', cmd],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            log(f"Discord embed script error: {result.stderr.strip()}")
+            return False
+        return True
+    except Exception as e:
+        log(f"Discord embed script error: {e}")
+        return False
+
+
+def send_discord_summary(summary: str, data: dict, hours: int, dry_run: bool) -> None:
+    """Post BAM summary to Discord via standard embed helper."""
     totals = data["metric_totals"]
     has_failures = (
         totals.get("bundle_forward_to_scheduler_fail", 0) > 0
@@ -302,9 +340,9 @@ def send_discord_embed(summary: str, data: dict, hours: int, dry_run: bool) -> N
     has_events = len(data["events"]) > 0
 
     if has_failures or has_events:
-        color = 0xFF0000 if len(data["events"]) >= 5 else 0xFFAA00
+        severity = "error" if len(data["events"]) >= 5 else "warning"
     else:
-        color = 0x00FF00
+        severity = "ok"
 
     time_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
     title = f"BAM Hourly Summary — {time_str}"
@@ -315,59 +353,27 @@ def send_discord_embed(summary: str, data: dict, hours: int, dry_run: bool) -> N
         + totals.get("outbound_fail", 0)
     )
 
-    if len(summary) > 4000:
-        summary = summary[:3997] + "..."
-    escaped_summary = json.dumps(summary)[1:-1]
-
-    payload = json.dumps({
-        "username": BOT_USERNAME,
-        "avatar_url": BOT_AVATAR,
-        "embeds": [{
-            "title": title,
-            "description": escaped_summary,
-            "color": color,
-            "fields": [
-                {"name": "Host", "value": HOSTNAME, "inline": True},
-                {"name": "Window", "value": f"Past {hours}h", "inline": True},
-                {"name": "Bundles", "value": str(bundles), "inline": True},
-                {"name": "Heartbeats", "value": str(totals.get("heartbeat_received", 0)), "inline": True},
-                {"name": "Failures", "value": str(failures), "inline": True},
-                {"name": "Events", "value": str(len(data["events"])), "inline": True},
-            ],
-            "footer": {"text": "BAM Hourly Summary — AI Analysis"},
-            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        }],
-    }).encode("utf-8")
+    # Append key metrics to description
+    description = summary
+    description += f"\n\n**Bundles:** {bundles} | **Heartbeats:** {totals.get('heartbeat_received', 0)}"
+    description += f" | **Failures:** {failures} | **Events:** {len(data['events'])}"
 
     if dry_run:
         log("DRY RUN — would send to Discord:")
-        print(summary)
+        print(description)
         return
 
-    req = urllib.request.Request(
-        get_discord_webhook(),
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            log(f"Discord notification sent (HTTP {resp.status})")
-    except urllib.error.HTTPError as e:
-        log(f"WARNING: Discord webhook failed with HTTP {e.code}")
+    _call_discord_embed(severity, title, description)
 
 
 def send_healthy_embed(data: dict, hours: int, dry_run: bool) -> None:
     """Post structured all-clear BAM status."""
     totals = data["metric_totals"]
-    now_utc = datetime.now(timezone.utc)
-    time_str = now_utc.strftime("%H:%M UTC")
+    time_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
     title = f"BAM Hourly Summary — {time_str}"
 
-    # Build structured description matching testnet format
     lines = [
-        f"\u2705 BAM connection healthy — no issues detected",
+        "\u2705 BAM connection healthy — no issues detected",
         "",
         f"Scheduler events: {data['metric_minutes']}",
         f"Leader slots: {data['leader_slots']}",
@@ -375,7 +381,6 @@ def send_healthy_embed(data: dict, hours: int, dry_run: bool) -> None:
         "Metrics:",
     ]
 
-    # Show all non-zero metric totals as bullet points
     for field in [
         "bundle_received", "bundleresult_sent",
         "heartbeat_received", "heartbeat_sent", "leaderstate_sent",
@@ -386,38 +391,12 @@ def send_healthy_embed(data: dict, hours: int, dry_run: bool) -> None:
 
     description = "\n".join(lines)
 
-    payload = json.dumps({
-        "username": BOT_USERNAME,
-        "avatar_url": BOT_AVATAR,
-        "embeds": [{
-            "title": title,
-            "description": description,
-            "color": 0x00FF00,
-            "fields": [
-                {"name": "Host", "value": HOSTNAME, "inline": True},
-            ],
-            "footer": {"text": "BAM Hourly Summary"},
-            "timestamp": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        }],
-    }).encode("utf-8")
-
     if dry_run:
         log("DRY RUN — would send to Discord:")
         print(f"\n{title}\n{description}\n")
         return
 
-    req = urllib.request.Request(
-        get_discord_webhook(),
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            log(f"Discord notification sent (HTTP {resp.status})")
-    except urllib.error.HTTPError as e:
-        log(f"WARNING: Discord webhook failed with HTTP {e.code}")
+    _call_discord_embed("ok", title, description)
 
 
 def main() -> None:
@@ -463,7 +442,7 @@ def main() -> None:
         ai_summary += f"Bundles: {totals.get('bundle_received', 0)}, "
         ai_summary += f"Failures: {failure_count}, Events: {event_count}"
 
-    send_discord_embed(ai_summary, data, args.hours, args.dry_run)
+    send_discord_summary(ai_summary, data, args.hours, args.dry_run)
     log("Done.")
 
 

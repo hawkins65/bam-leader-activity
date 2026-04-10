@@ -13,8 +13,9 @@ if [[ -z "$DISCORD_WEBHOOK" ]]; then
     echo "ERROR: Discord webhook not found at ~/.config/discord/webhook" >&2
     exit 1
 fi
-BOT_USERNAME="Validator Log Monitor"
-BOT_AVATAR="https://trillium.so/images/trillium-default.png"
+DISCORD_EMBED_SCRIPT="$HOME/999_discord_embed.sh"
+BOT_USERNAME="BAM Log Monitor"
+SCRIPT_PATH="$(hostname):$(readlink -f "${BASH_SOURCE[0]}")"
 VALIDATOR_LOG="$HOME/logs/validator.log"
 STATE_DIR="$HOME/.log_monitor/bam"
 OFFSET_DIR="$STATE_DIR/offsets"
@@ -171,51 +172,23 @@ if new_hashes:
 " "$hash_file"
 }
 
+# Send Discord embed via standard helper
+# shellcheck source=/home/sol/999_discord_embed.sh
+source "$DISCORD_EMBED_SCRIPT"
+
 send_discord() {
     local title="$1"
     local description="$2"
-    local color="${3:-16711680}"
+    local severity="${3:-error}"
 
-    if (( ${#description} > 4000 )); then
-        description="${description:0:3990}..."
-    fi
+    # Use \n literals — the embed script converts them to real newlines
+    description="${description//$'\n'/\\n}"
 
-    local escaped_desc
-    escaped_desc=$(python3 -c "
-import json, sys
-print(json.dumps(sys.stdin.read()))" <<< "$description")
-
-    local escaped_title
-    escaped_title=$(python3 -c "
-import json, sys
-print(json.dumps(sys.stdin.read().strip()))" <<< "$title")
-
-    local payload
-    payload=$(cat <<EOJSON
-{
-  "username": "$BOT_USERNAME",
-  "avatar_url": "$BOT_AVATAR",
-  "embeds": [{
-    "title": $escaped_title,
-    "description": $escaped_desc,
-    "color": $color,
-    "timestamp": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-  }]
-}
-EOJSON
-)
-
-    local response
-    response=$(curl -s -o /dev/null -w "%{http_code}" \
-        -H "Content-Type: application/json" \
-        -d "$payload" \
-        "$DISCORD_WEBHOOK")
-
-    if [[ "$response" == "204" || "$response" == "200" ]]; then
-        debug "Discord message sent (HTTP $response)"
-    else
-        log "WARNING: Discord returned HTTP $response"
-    fi
+    send_discord_embed "$DISCORD_WEBHOOK" "$severity" \
+        "$title" "$description" \
+        username="$BOT_USERNAME" \
+        script_path="$SCRIPT_PATH" \
+        pagerduty=false
 }
 
 ###############################################################################
@@ -327,7 +300,7 @@ do_failover() {
         log "ERROR: No reachable alternative BAM regions"
         send_discord "BAM Failover Failed" \
             "No reachable alternative BAM regions.\nCurrent: **${current_region}**\nAll regions unreachable." \
-            16711680  # Red
+            "error"
         return 1
     }
 
@@ -344,13 +317,13 @@ do_failover() {
         log "Failover complete: $current_region -> $best_region"
         send_discord "BAM Failover: ${current_region} -> ${best_region}" \
             "Switched BAM node due to repeated errors.\n**From:** ${current_region}\n**To:** ${best_region}\n**Time:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" \
-            16744448  # Orange
+            "warning"
         return 0
     else
         log "ERROR: Failed to apply BAM URL switch"
         send_discord "BAM Failover Failed" \
             "Could not switch BAM node via admin RPC.\n**From:** ${current_region}\n**To:** ${best_region} (attempted)" \
-            16711680  # Red
+            "error"
         return 1
     fi
 }
@@ -387,7 +360,7 @@ check_recovery() {
             log "Recovery complete: back to $preferred_region"
             send_discord "BAM Recovery: Back to ${preferred_region}" \
                 "Preferred BAM node is healthy again.\n**Restored:** ${preferred_region}\n**Was on:** ${fallback_region}\n**Time:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" \
-                5763719  # Green
+                "ok"
             return 0
         else
             log "ERROR: Failed to switch back to preferred region"
@@ -448,7 +421,7 @@ scan_bam() {
                 desc+=$'\n'"_(showing 5 of $count errors)_"
             fi
 
-            send_discord "$title" "$desc" 16711680  # Red
+            send_discord "$title" "$desc" "error"
             sleep 2
         fi
     fi
@@ -482,7 +455,7 @@ scan_bam() {
                 desc+=$'\n'"_(showing 5 of $count anomalies)_"
             fi
 
-            send_discord "$title" "$desc" 16744448  # Orange (0xFF9900)
+            send_discord "$title" "$desc" "warning"
             sleep 2
         fi
     fi

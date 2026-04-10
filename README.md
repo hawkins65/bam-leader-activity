@@ -254,3 +254,147 @@ Skipped slots are detected by comparing two sets of data:
 2. **Produced slots** - collected from `cost_tracker_stats,is_leader=true` log entries, which are only emitted when a block is actually produced
 
 A slot is marked as **skipped** if it appears in the announced set but not in the produced set. This happens when the validator was scheduled to lead but failed to produce a block (due to timing issues, fork choice, etc.).
+
+## Discord Notifications
+
+Several scripts in this repo send alerts and summaries to Discord:
+
+- `bam-hourly-summary.py` — hourly BAM status summaries
+- `bam-log-monitor.sh` — real-time error/anomaly alerts, failover notifications
+- `leader-capture-monitor.sh` — bundle capture results
+- `capture-bundle-txns.sh` — bundle transaction capture reports
+
+These scripts depend on an external `send_discord_embed` shell function that is **not included in this repo** (it lives at `~/999_discord_embed.sh`). You need to provide your own implementation.
+
+### Discord webhook setup
+
+All scripts read the webhook URL from:
+
+```
+~/.config/discord/webhook
+```
+
+Create a [Discord webhook](https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks) for your channel, then:
+
+```bash
+mkdir -p ~/.config/discord
+echo "https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN" > ~/.config/discord/webhook
+```
+
+### Discord embed helper
+
+Create `~/999_discord_embed.sh` with a `send_discord_embed` function matching this interface:
+
+```bash
+send_discord_embed <webhook_url> <severity> <title> <description> [KEY=VALUE...]
+```
+
+**Positional arguments:**
+
+| Arg | Description |
+|-----|-------------|
+| `webhook_url` | Discord webhook URL |
+| `severity` | One of: `ok`, `info`, `warning`, `error`, `critical` |
+| `title` | Embed title |
+| `description` | Embed body text (may contain `\n` literals for newlines) |
+
+**Optional KEY=VALUE arguments:**
+
+| Key | Description |
+|-----|-------------|
+| `username` | Bot display name |
+| `script_path` | Shown in embed footer for traceability |
+| `footer_extra` | Additional footer text |
+| `pagerduty` | Set to `false` to suppress any PagerDuty integration (default: `true`) |
+
+### Minimal reference implementation
+
+Below is a minimal implementation you can use as a starting point. Adapt it to your needs (colors, avatar, alerting integrations, etc.):
+
+```bash
+#!/bin/bash
+# ~/999_discord_embed.sh - Minimal Discord embed helper
+#
+# Source this file, then call:
+#   send_discord_embed <webhook_url> <severity> <title> <description> [KEY=VALUE...]
+
+send_discord_embed() {
+    local webhook_url="$1"
+    local severity="$2"
+    local title="$3"
+    local description="$4"
+    shift 4
+
+    # Parse optional KEY=VALUE args
+    local username="Validator Monitor"
+    local script_path="" footer_extra=""
+    for arg in "$@"; do
+        case "$arg" in
+            username=*)     username="${arg#username=}" ;;
+            script_path=*)  script_path="${arg#script_path=}" ;;
+            footer_extra=*) footer_extra="${arg#footer_extra=}" ;;
+            pagerduty=*)    ;;  # ignored in this minimal version
+        esac
+    done
+
+    # Map severity to Discord embed color (decimal)
+    local color
+    case "$severity" in
+        ok)       color=5361510  ;;  # green
+        info)     color=3382000  ;;  # blue
+        warning)  color=16002055 ;;  # gold
+        error)    color=16738155 ;;  # red
+        critical) color=14045233 ;;  # dark red
+        *)        color=3382000  ;;  # default blue
+    esac
+
+    # Convert \n literals to real newlines
+    description="${description//\\n/$'\n'}"
+
+    # Truncate to Discord's 4096-char embed limit
+    if (( ${#description} > 4000 )); then
+        description="${description:0:3997}..."
+    fi
+
+    # Build footer
+    local footer_text=""
+    [[ -n "$script_path" ]]  && footer_text="$script_path"
+    [[ -n "$footer_extra" ]] && footer_text="${footer_text:+$footer_text | }$footer_extra"
+    footer_text="${footer_text:+$footer_text • }$(date -u +"%Y-%m-%d %H:%M UTC")"
+
+    # Build and send JSON payload
+    local payload
+    payload=$(jq -n \
+        --arg username "$username" \
+        --arg title "$title" \
+        --arg description "$description" \
+        --argjson color "$color" \
+        --arg footer_text "$footer_text" \
+        --arg timestamp "$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")" \
+        '{
+            username: $username,
+            embeds: [{
+                title: $title,
+                description: $description,
+                color: $color,
+                timestamp: $timestamp,
+                footer: { text: $footer_text }
+            }]
+        }')
+
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+        -H "Content-Type: application/json" \
+        -X POST -d "$payload" "$webhook_url")
+
+    [[ "$http_code" == "200" || "$http_code" == "204" ]]
+}
+```
+
+**Requirements:** `jq` and `curl` must be installed.
+
+You can extend this with features like:
+- Custom avatar URLs
+- Discord user mentions on warning/error/critical severity
+- PagerDuty or other alerting integrations
+- Embed fields for structured data

@@ -201,3 +201,7 @@ Use the `--hours` option with journalctl to limit the time window:
 ```bash
 ./bundle-txn-signatures.py -j --hours 1
 ```
+
+## Discord Notifications
+
+`capture-bundle-txns.sh` and `leader-capture-monitor.sh` send capture results to Discord. See [Discord Notifications](README.md#discord-notifications) in the main README for webhook and embed helper setup.

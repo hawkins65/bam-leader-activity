@@ -254,4 +254,7 @@ The validator does not have `--bam-url` configured. To enable BAM:
 ## Related Scripts
 
 - `bam-leader-activity.py` - Analyzes bundle activity during leader slots
+- `bam-log-monitor.sh` - Real-time BAM error monitoring with Discord alerts (see [Discord Notifications](README.md#discord-notifications) for setup)
+- `bam-hourly-summary.py` - Hourly BAM status summaries posted to Discord
 - `bundle-txn-signatures.py` - Extracts transaction signatures from bundle logs (requires DEBUG logging)
+- `leader-capture-monitor.sh` - Automated bundle capture around leader slots
