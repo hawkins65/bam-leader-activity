@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-set -uo pipefail
-trap '' PIPE
+set -u
+
+# Redirect all output to log file (avoids systemd StandardOutput=append: FD
+# inheritance issues that cause bash wait/pipefail to deadlock in subshells)
+LOG_FILE="${HOME}/logs/leader-capture-monitor.log"
+exec >> "$LOG_FILE" 2>&1
 
 ###############################################################################
 # Leader Slot Capture Monitor
