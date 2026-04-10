@@ -334,11 +334,11 @@ run_capture_cycle() {
     # Calculate time until the leader window
     local slots_until_start=$(( first_slot - current_slot ))
     local seconds_until_start
-    seconds_until_start=$(echo "$slots_until_start * $slot_duration" | bc | cut -d. -f1)
+    seconds_until_start=$(printf '%.0f' "$(echo "$slots_until_start * $slot_duration" | bc)")
 
     local total_leader_slots=$(( last_slot - first_slot + 1 ))
     local leader_duration_seconds
-    leader_duration_seconds=$(echo "$total_leader_slots * $slot_duration" | bc | cut -d. -f1)
+    leader_duration_seconds=$(printf '%.0f' "$(echo "$total_leader_slots * $slot_duration" | bc)")
 
     log "Next leader window: slots $first_slot-$last_slot ($num_groups group(s), $(duration_fmt $leader_duration_seconds))"
     log "Leader slots start in ~$(duration_fmt $seconds_until_start)"
@@ -369,7 +369,7 @@ run_capture_cycle() {
         read -r first_slot last_slot num_groups <<< "$(echo "$windows" | head -1)"
 
         slots_until_start=$(( first_slot - current_slot ))
-        seconds_until_start=$(echo "$slots_until_start * $slot_duration" | bc | cut -d. -f1)
+        seconds_until_start=$(printf '%.0f' "$(echo "$slots_until_start * $slot_duration" | bc)")
 
         debug "Drift check: $slots_until_start slots away (~$(duration_fmt $seconds_until_start))"
 
@@ -423,7 +423,7 @@ run_capture_cycle() {
         if (( slots_past_end > 0 )); then
             slot_duration=$(get_slot_duration)
             local seconds_past
-            seconds_past=$(echo "$slots_past_end * $slot_duration" | bc | cut -d. -f1)
+            seconds_past=$(printf '%.0f' "$(echo "$slots_past_end * $slot_duration" | bc)")
 
             if (( seconds_past >= BUFFER_AFTER_SECONDS )); then
                 log "Post-buffer complete (${seconds_past}s past last slot)"
