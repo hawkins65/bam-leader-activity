@@ -137,90 +137,70 @@ duration_fmt() {
 
 # ── Slot timing functions ────────────────────────────────────────────────────
 
+rpc_call() {
+    curl -s --max-time 10 "$RPC_URL" -X POST -H "Content-Type: application/json" -d "$1"
+}
+
 get_slot_duration() {
-    local samples
-    samples=$(curl -s "$RPC_URL" -X POST -H "Content-Type: application/json" \
-        -d '{"jsonrpc":"2.0","id":1,"method":"getRecentPerformanceSamples","params":[1]}')
-    local num_slots sample_period
-    num_slots=$(echo "$samples" | jq -r '.result[0].numSlots')
-    sample_period=$(echo "$samples" | jq -r '.result[0].samplePeriodSecs')
-
-    if [[ -z "$num_slots" || "$num_slots" == "null" || -z "$sample_period" || "$sample_period" == "null" ]]; then
-        echo "0.000420"  # fallback ~420ms
-        return 1
-    fi
-
-    echo "scale=6; $sample_period / $num_slots" | bc -l
+    local result
+    result=$(rpc_call '{"jsonrpc":"2.0","id":1,"method":"getRecentPerformanceSamples","params":[1]}')
+    local dur
+    dur=$(echo "$result" | jq -r 'if .result[0] then (.result[0].samplePeriodSecs / .result[0].numSlots | tostring) else empty end' 2>/dev/null)
+    echo "${dur:-0.000420}"
 }
 
 get_current_slot() {
-    solana -u "$RPC_URL" slot 2>/dev/null
+    local result
+    result=$(rpc_call '{"jsonrpc":"2.0","id":1,"method":"getSlot","params":[{"commitment":"confirmed"}]}')
+    echo "$result" | jq -r '.result // empty' 2>/dev/null
 }
 
 # Get upcoming leader slot groups as merged capture windows.
-# Output: one line per capture window with format:
-#   first_slot last_slot num_groups
-# where groups within MERGE_GAP_SECONDS are merged.
+# Uses getLeaderSchedule + getEpochInfo via RPC, processes with jq.
+# Output: one line per window: "first_slot last_slot num_groups"
 get_capture_windows() {
     local current_slot="$1"
     local slot_duration="$2"
 
-    # Get upcoming leader slots
-    local leader_slots
-    leader_slots=$(solana -u "$RPC_URL" leader-schedule 2>/dev/null \
-        | grep "$VALIDATOR_IDENTITY" \
-        | awk '{print $1}' \
-        | sort -n \
-        | awk -v cs="$current_slot" '$1 > cs')
+    # Get epoch start slot (leader schedule returns offsets from epoch start)
+    local epoch_info epoch_start
+    epoch_info=$(rpc_call '{"jsonrpc":"2.0","id":1,"method":"getEpochInfo","params":[{"commitment":"confirmed"}]}')
+    epoch_start=$(echo "$epoch_info" | jq -r '.result | .absoluteSlot - .slotIndex' 2>/dev/null)
 
-    if [[ -z "$leader_slots" ]]; then
-        debug "No upcoming leader slots found"
+    if [[ -z "$epoch_start" || "$epoch_start" == "null" ]]; then
+        debug "Could not get epoch info"
         return 1
     fi
 
-    # Group consecutive slots into leader groups, then merge close groups
-    python3 -c "
-import sys
+    local result
+    result=$(rpc_call "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getLeaderSchedule\",\"params\":[null,{\"identity\":\"$VALIDATOR_IDENTITY\"}]}")
 
-slot_duration = float('$slot_duration')
-merge_gap = int('$MERGE_GAP_SECONDS')
-current_slot = int('$current_slot')
-
-slots = [int(s) for s in '''$leader_slots'''.strip().split('\n') if s.strip()]
-if not slots:
-    sys.exit(1)
-
-# Build consecutive groups
-groups = []
-group_start = slots[0]
-group_end = slots[0]
-for s in slots[1:]:
-    if s == group_end + 1:
-        group_end = s
-    else:
-        groups.append((group_start, group_end))
-        group_start = s
-        group_end = s
-groups.append((group_start, group_end))
-
-# Merge groups that are close together
-merged = [groups[0]]
-merge_count = [1]
-for g_start, g_end in groups[1:]:
-    prev_start, prev_end = merged[-1]
-    gap_slots = g_start - prev_end
-    gap_seconds = gap_slots * slot_duration
-    if gap_seconds < merge_gap:
-        merged[-1] = (prev_start, g_end)
-        merge_count[-1] += 1
-    else:
-        merged.append((g_start, g_end))
-        merge_count.append(1)
-
-# Output: first_slot last_slot num_groups_merged
-for i, (first, last) in enumerate(merged):
-    print(f'{first} {last} {merge_count[i]}')
-" 2>/dev/null
+    echo "$result" | jq -r --argjson cs "$current_slot" --argjson es "$epoch_start" \
+        --argjson sd "$slot_duration" --argjson mg "$MERGE_GAP_SECONDS" \
+        --arg id "$VALIDATOR_IDENTITY" '
+        .result[$id] // empty
+        | map(. + $es)
+        | map(select(. > $cs))
+        | sort
+        | if length == 0 then empty else
+            # Group consecutive slots
+            reduce .[] as $s ([];
+                if length == 0 then [[($s), ($s)]]
+                elif (.[length-1][1] + 1) == $s then .[length-1][1] = $s
+                else . + [[($s), ($s)]]
+                end
+            )
+            # Merge groups closer than merge_gap seconds
+            | reduce .[] as $g ([];
+                if length == 0 then [$g]
+                elif (($g[0] - .[length-1][1]) * $sd) < $mg then .[length-1] = [.[length-1][0], $g[1]]
+                else . + [$g]
+                end
+            )
+            | .[]
+            | "\(.[0]) \(.[1]) 1"
+          end
+    ' 2>/dev/null
 }
 
 # ── Capture logic ─────────────────────────────────────────────────────────────
@@ -245,9 +225,9 @@ extract_and_report() {
         return 0
     fi
 
-    # Query RPC for block data from our leader slots
-    "$SLOT_TRANSACTIONS_SCRIPT" --slots "$first_slot" "$last_slot" > "$text_file" 2>&1
-    "$SLOT_TRANSACTIONS_SCRIPT" --slots "$first_slot" "$last_slot" --json > "$json_file" 2>&1
+    # Query RPC for block data from our leader slots (stderr has progress, keep it separate)
+    "$SLOT_TRANSACTIONS_SCRIPT" --slots "$first_slot" "$last_slot" > "$text_file" 2>/dev/null
+    "$SLOT_TRANSACTIONS_SCRIPT" --slots "$first_slot" "$last_slot" --json > "$json_file" 2>/dev/null
 
     # Parse summary from JSON output
     local total_txns success_count failed_count total_fees_sol skipped_slots
@@ -351,7 +331,8 @@ run_capture_cycle() {
         log "Merged $num_groups nearby leader rotations into single capture window"
     fi
 
-    # ── Wait phase: re-check timing frequently to handle drift ────────────
+    # ── Wait phase: sleep until leader slots arrive ─────────────────────
+    # Target window is locked in — don't re-query or we'll skip past it
     while true; do
         current_slot=$(get_current_slot)
         if [[ -z "$current_slot" ]]; then
@@ -360,32 +341,24 @@ run_capture_cycle() {
             continue
         fi
 
-        # Recalculate slot duration periodically for accuracy
-        slot_duration=$(get_slot_duration)
+        slots_until_start=$(( first_slot - current_slot ))
 
-        # Recalculate windows to handle drift and possible schedule changes
-        windows=$(get_capture_windows "$current_slot" "$slot_duration")
-        if [[ -z "$windows" ]]; then
-            log "Leader slots no longer found (epoch boundary?). Restarting cycle."
-            return 1
+        # If leader slots have arrived (or passed)
+        if (( slots_until_start <= 0 )); then
+            log "Leader slots reached! (current=$current_slot, target=$first_slot)"
+            break
         fi
 
-        read -r first_slot last_slot num_groups <<< "$(echo "$windows" | head -1)"
-
-        slots_until_start=$(( first_slot - current_slot ))
+        slot_duration=$(get_slot_duration)
         seconds_until_start=$(printf '%.0f' "$(echo "$slots_until_start * $slot_duration" | bc)")
 
         debug "Drift check: $slots_until_start slots away (~$(duration_fmt $seconds_until_start))"
 
-        # If leader slots have arrived
-        if (( slots_until_start <= 0 )); then
-            log "Leader slots reached!"
-            break
-        fi
-
-        # Adaptive sleep: shorter when close, longer when far
+        # Adaptive sleep: faster when close
         local sleep_time
-        if (( seconds_until_start < NEAR_THRESHOLD )); then
+        if (( seconds_until_start < 30 )); then
+            sleep_time=$MIN_SLEEP
+        elif (( seconds_until_start < NEAR_THRESHOLD )); then
             sleep_time=$POLL_INTERVAL_NEAR
         else
             sleep_time=$POLL_INTERVAL_FAR
