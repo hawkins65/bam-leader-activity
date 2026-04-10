@@ -37,24 +37,19 @@ source "$VALIDATOR_CONFIG"
 RPC_URL="${MAINNET_RPC_URL:?MAINNET_RPC_URL not set in $VALIDATOR_CONFIG}"
 VALIDATOR_IDENTITY="${VALIDATOR_IDENTITY:?VALIDATOR_IDENTITY not set in $VALIDATOR_CONFIG}"
 
-LEDGER_DIR="/mnt/ledger"
-LOG_FILE="$HOME/logs/validator.log"
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 OUTPUT_DIR="$SCRIPT_DIR/captures"
-STATE_DIR="$HOME/.log_monitor/leader_capture"
 
 # Timing configuration
-BUFFER_SECONDS=60           # Start capture this many seconds before first slot
-BUFFER_AFTER_SECONDS=60     # Keep capturing this many seconds after last slot
+BUFFER_AFTER_SECONDS=60     # Wait this long after last slot before querying RPC
 MERGE_GAP_SECONDS=180       # Merge groups closer than this (3 minutes)
 POLL_INTERVAL_FAR=60        # Poll interval when next slot is far away (>5 min)
 POLL_INTERVAL_NEAR=30       # Poll interval when next slot is near (<5 min)
 NEAR_THRESHOLD=300          # "Near" means within this many seconds (5 min)
 MIN_SLEEP=5                 # Never sleep less than this
 
-# Log filter settings
-DEBUG_FILTER="solana=info,solana_core::bundle_stage=debug"
-DEFAULT_FILTER="solana=info,agave=info"
+# RPC-based extraction (BAM bundles don't produce debug logs)
+SLOT_TRANSACTIONS_SCRIPT="$SCRIPT_DIR/slot-transactions.py"
 
 # Discord
 DISCORD_WEBHOOK="$(cat "$HOME/.config/discord/webhook" 2>/dev/null | tr -d '[:space:]')"
@@ -91,7 +86,7 @@ done
 log() { echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] $*"; }
 debug() { $VERBOSE && log "DEBUG: $*"; }
 
-mkdir -p "$OUTPUT_DIR" "$STATE_DIR"
+mkdir -p "$OUTPUT_DIR"
 
 # Source Discord embed helper
 if [[ -f "$DISCORD_EMBED_SCRIPT" ]]; then
@@ -226,35 +221,6 @@ for i, (first, last) in enumerate(merged):
 
 # ── Capture logic ─────────────────────────────────────────────────────────────
 
-enable_debug_logging() {
-    if $DRY_RUN; then
-        log "[DRY-RUN] Would enable debug logging: $DEBUG_FILTER"
-        return 0
-    fi
-    log "Enabling DEBUG logging for bundle_stage..."
-    if agave-validator -l "$LEDGER_DIR" set-log-filter "$DEBUG_FILTER" 2>/dev/null; then
-        log "Log filter set to: $DEBUG_FILTER"
-        return 0
-    else
-        log "ERROR: Failed to set log filter"
-        return 1
-    fi
-}
-
-disable_debug_logging() {
-    if $DRY_RUN; then
-        log "[DRY-RUN] Would restore default logging: $DEFAULT_FILTER"
-        return 0
-    fi
-    log "Restoring default log filter..."
-    if agave-validator -l "$LEDGER_DIR" set-log-filter "$DEFAULT_FILTER" 2>/dev/null; then
-        log "Log filter restored to: $DEFAULT_FILTER"
-        return 0
-    else
-        log "WARNING: Failed to restore default log filter"
-        return 1
-    fi
-}
 
 extract_and_report() {
     local capture_start_time="$1"
@@ -265,62 +231,63 @@ extract_and_report() {
 
     local timestamp
     timestamp=$(date -u +"%Y%m%d_%H%M%S")
-    local text_file="$OUTPUT_DIR/bundle_txns_${timestamp}.txt"
-    local json_file="$OUTPUT_DIR/bundle_txns_${timestamp}.json"
+    local text_file="$OUTPUT_DIR/slot_txns_${timestamp}.txt"
+    local json_file="$OUTPUT_DIR/slot_txns_${timestamp}.json"
 
-    log "Extracting bundle transaction signatures..."
+    log "Querying RPC for leader slot transactions..."
 
     if $DRY_RUN; then
-        log "[DRY-RUN] Would extract signatures and report to Discord"
+        log "[DRY-RUN] Would query slots $first_slot–$last_slot and report to Discord"
         return 0
     fi
 
-    # Run the extraction script
-    "$SCRIPT_DIR/bundle-txn-signatures.py" "$LOG_FILE" > "$text_file" 2>&1
-    "$SCRIPT_DIR/bundle-txn-signatures.py" "$LOG_FILE" --json > "$json_file" 2>&1
+    # Query RPC for block data from our leader slots
+    "$SLOT_TRANSACTIONS_SCRIPT" --slots "$first_slot" "$last_slot" > "$text_file" 2>&1
+    "$SLOT_TRANSACTIONS_SCRIPT" --slots "$first_slot" "$last_slot" --json > "$json_file" 2>&1
 
-    # Parse summary from output
-    local total_bundles total_txns avg_txns
-    total_bundles=$(grep -oP 'Total bundles processed: \K[\d,]+' "$text_file" 2>/dev/null | tr -d ',')
-    total_txns=$(grep -oP 'Total transactions: \K[\d,]+' "$text_file" 2>/dev/null | tr -d ',')
-    avg_txns=$(grep -oP 'Avg transactions per bundle: \K[\d.]+' "$text_file" 2>/dev/null)
+    # Parse summary from JSON output
+    local total_txns success_count failed_count total_fees_sol skipped_slots
+    total_txns=$(python3 -c "import json; d=json.load(open('$json_file')); print(d['summary']['total_non_vote_transactions'])" 2>/dev/null)
+    success_count=$(python3 -c "import json; d=json.load(open('$json_file')); print(d['summary']['successful'])" 2>/dev/null)
+    failed_count=$(python3 -c "import json; d=json.load(open('$json_file')); print(d['summary']['failed'])" 2>/dev/null)
+    total_fees_sol=$(python3 -c "import json; d=json.load(open('$json_file')); print(f\"{d['summary']['total_fees_sol']:.6f}\")" 2>/dev/null)
+    skipped_slots=$(python3 -c "import json; d=json.load(open('$json_file')); print(d['summary']['skipped_slots'])" 2>/dev/null)
 
-    # Parse results breakdown
-    local success_count
-    success_count=$(grep -oP 'success: \K[\d,]+' "$text_file" 2>/dev/null | tr -d ',')
-
-    total_bundles="${total_bundles:-0}"
     total_txns="${total_txns:-0}"
-    avg_txns="${avg_txns:-0}"
     success_count="${success_count:-0}"
+    failed_count="${failed_count:-0}"
+    total_fees_sol="${total_fees_sol:-0}"
+    skipped_slots="${skipped_slots:-0}"
 
     local capture_duration=$(( capture_end_time - capture_start_time ))
     local slot_range="${first_slot}–${last_slot}"
     local total_slots=$(( last_slot - first_slot + 1 ))
-
-    # Build Discord message
-    local severity="info"
-    if (( total_bundles == 0 )); then
-        severity="warning"
-    fi
+    local produced_slots=$(( total_slots - skipped_slots ))
 
     local group_label="rotation"
     if (( num_groups > 1 )); then
         group_label="${num_groups} rotations"
     fi
 
+    # Build Discord message
+    local severity="info"
+    if (( total_txns == 0 )); then
+        severity="warning"
+    fi
+
     local desc=""
     desc+="**Slots:** ${slot_range} (${total_slots} slots across ${group_label})"
-    desc+=$'\n'"**Capture window:** $(duration_fmt $capture_duration)"
-    desc+=$'\n'"**Bundles:** ${total_bundles} | **Transactions:** ${total_txns}"
-    if (( total_bundles > 0 )); then
-        desc+=$'\n'"**Avg txns/bundle:** ${avg_txns} | **Successful:** ${success_count}"
+    if (( skipped_slots > 0 )); then
+        desc+=", ${skipped_slots} skipped"
     fi
+    desc+=$'\n'"**Capture window:** $(duration_fmt $capture_duration)"
+    desc+=$'\n'"**Transactions:** ${total_txns} (${success_count} success, ${failed_count} failed)"
+    desc+=$'\n'"**Fees earned:** ${total_fees_sol} SOL"
     desc+=$'\n'"**Output:** ${text_file}"
 
-    local title="Bundle Capture Complete"
-    if (( total_bundles == 0 )); then
-        title="Bundle Capture — No Bundles Found"
+    local title="Leader Slot Report"
+    if (( total_txns == 0 )); then
+        title="Leader Slot Report — No Transactions"
     fi
 
     send_discord "$title" "$desc" "$severity"
@@ -328,9 +295,10 @@ extract_and_report() {
 
     # Log summary locally
     log "Capture summary:"
-    log "  Slots: $slot_range ($total_slots slots, $group_label)"
+    log "  Slots: $slot_range ($produced_slots produced, $skipped_slots skipped)"
     log "  Duration: $(duration_fmt $capture_duration)"
-    log "  Bundles: $total_bundles | Transactions: $total_txns"
+    log "  Transactions: $total_txns ($success_count success, $failed_count failed)"
+    log "  Fees: $total_fees_sol SOL"
     log "  Output: $text_file"
 }
 
@@ -363,22 +331,17 @@ run_capture_cycle() {
     read -r first_slot last_slot num_groups <<< "$(echo "$windows" | head -1)"
     debug "Next capture window: slots $first_slot-$last_slot ($num_groups group(s) merged)"
 
-    # Calculate time until the capture window
+    # Calculate time until the leader window
     local slots_until_start=$(( first_slot - current_slot ))
     local seconds_until_start
     seconds_until_start=$(echo "$slots_until_start * $slot_duration" | bc | cut -d. -f1)
-
-    local capture_start_offset=$(( seconds_until_start - BUFFER_SECONDS ))
 
     local total_leader_slots=$(( last_slot - first_slot + 1 ))
     local leader_duration_seconds
     leader_duration_seconds=$(echo "$total_leader_slots * $slot_duration" | bc | cut -d. -f1)
 
-    local capture_total_seconds=$(( BUFFER_SECONDS + leader_duration_seconds + BUFFER_AFTER_SECONDS ))
-
     log "Next leader window: slots $first_slot-$last_slot ($num_groups group(s), $(duration_fmt $leader_duration_seconds))"
-    log "Capture starts in ~$(duration_fmt $capture_start_offset) (with ${BUFFER_SECONDS}s pre-buffer)"
-    log "Total capture duration: ~$(duration_fmt $capture_total_seconds)"
+    log "Leader slots start in ~$(duration_fmt $seconds_until_start)"
 
     if (( num_groups > 1 )); then
         log "Merged $num_groups nearby leader rotations into single capture window"
@@ -407,27 +370,26 @@ run_capture_cycle() {
 
         slots_until_start=$(( first_slot - current_slot ))
         seconds_until_start=$(echo "$slots_until_start * $slot_duration" | bc | cut -d. -f1)
-        capture_start_offset=$(( seconds_until_start - BUFFER_SECONDS ))
 
-        debug "Drift check: $slots_until_start slots away (~$(duration_fmt $seconds_until_start)), capture in ~$(duration_fmt $capture_start_offset)"
+        debug "Drift check: $slots_until_start slots away (~$(duration_fmt $seconds_until_start))"
 
-        # If it's time to start the capture
-        if (( capture_start_offset <= 0 )); then
-            log "Capture window reached! Starting capture."
+        # If leader slots have arrived
+        if (( slots_until_start <= 0 )); then
+            log "Leader slots reached!"
             break
         fi
 
         # Adaptive sleep: shorter when close, longer when far
         local sleep_time
-        if (( capture_start_offset < NEAR_THRESHOLD )); then
+        if (( seconds_until_start < NEAR_THRESHOLD )); then
             sleep_time=$POLL_INTERVAL_NEAR
         else
             sleep_time=$POLL_INTERVAL_FAR
         fi
 
-        # Don't sleep longer than the time until capture
-        if (( sleep_time > capture_start_offset )); then
-            sleep_time=$capture_start_offset
+        # Don't sleep longer than the time until leader slots
+        if (( sleep_time > seconds_until_start )); then
+            sleep_time=$seconds_until_start
         fi
         if (( sleep_time < MIN_SLEEP )); then
             sleep_time=$MIN_SLEEP
@@ -437,7 +399,7 @@ run_capture_cycle() {
         sleep "$sleep_time"
     done
 
-    # ── Capture phase ─────────────────────────────────────────────────────
+    # ── Wait for slots to pass ───────────────────────────────────────────
 
     local slots_str="${first_slot}–${last_slot}"
     local group_label="rotation"
@@ -446,21 +408,9 @@ run_capture_cycle() {
     local capture_start_time
     capture_start_time=$(date +%s)
 
-    # Enable debug logging
-    if ! enable_debug_logging; then
-        send_discord "Bundle Capture Failed" \
-            "Could not enable DEBUG logging for bundle_stage.\n**Slots:** ${slots_str}" \
-            "error"
-        return 1
-    fi
+    log "Waiting for leader slots to complete..."
 
-    # Record the log file size at capture start (for targeted extraction later)
-    local log_offset_start
-    log_offset_start=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
-    echo "$log_offset_start" > "$STATE_DIR/capture_log_offset"
-
-    # Wait through the leader slots + post-buffer, re-checking for drift
-    # to extend the window if the group's end drifts later
+    # Wait through the leader slots + post-buffer for blocks to finalize
     while true; do
         current_slot=$(get_current_slot)
         if [[ -z "$current_slot" ]]; then
@@ -488,9 +438,6 @@ run_capture_cycle() {
         sleep "$POLL_INTERVAL_NEAR"
     done
 
-    # Disable debug logging
-    disable_debug_logging
-
     local capture_end_time
     capture_end_time=$(date +%s)
 
@@ -502,10 +449,10 @@ run_capture_cycle() {
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-log "Leader Capture Monitor starting"
+log "Leader Capture Monitor starting (RPC mode)"
 log "  Validator: $VALIDATOR_IDENTITY"
 log "  RPC: ${RPC_URL%%://*}://***${RPC_URL##*/}"
-log "  Buffer: ${BUFFER_SECONDS}s before / ${BUFFER_AFTER_SECONDS}s after"
+log "  Post-slot buffer: ${BUFFER_AFTER_SECONDS}s (wait for block finalization)"
 log "  Merge gap: ${MERGE_GAP_SECONDS}s (groups closer than this are merged)"
 log "  Dry-run: $DRY_RUN"
 
