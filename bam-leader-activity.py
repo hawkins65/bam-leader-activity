@@ -558,9 +558,12 @@ def analyze_logs(line_source, source_name):
         print(f"{'MEDIAN':<26} | {median_txns:>8,.0f} | {median_votes:>8,.0f} | {median_user:>8,.0f} | {median_block_cost:>15,.0f} | {median_time_ms:>12.1f} | {format_lamports(median_total_fee):>14} | {format_lamports(median_priority_fee):>14}")
         print("=" * LEADER_TABLE_WIDTH)
     else:
-        print("No leader slot data found in logs.")
-        print("This validator is not on the leader schedule for the log period.")
-        print("(This is expected for hot-standby validators.)\n")
+        print("No leader slot data found in this log window.")
+        print("No leader slots landed in the time range covered by the log being analyzed.")
+        print("This does not mean the validator is off the schedule — check with")
+        print("`solana leader-schedule` or ~/show-my-next-leader-slot.sh. To see leader")
+        print("activity, analyze a longer window via `-j sol --hours N` or an older log file.")
+        print("(A genuinely empty result is also expected for hot-standby validators.)\n")
 
     # Additional stats
     if active_minutes:
