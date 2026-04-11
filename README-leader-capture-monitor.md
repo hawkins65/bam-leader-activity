@@ -123,39 +123,28 @@ For production use, run the monitor as a systemd service so it starts automatica
 
 ### Service file
 
-Create `/etc/systemd/system/leader-capture-monitor.service`:
+The authoritative unit file is tracked in this repo at [`leader-capture-monitor.service`](leader-capture-monitor.service). Install it with:
 
-```ini
-[Unit]
-Description=Leader Slot Bundle Capture Monitor
-After=network-online.target sol.service
-Wants=network-online.target
-# Optional: only run when the validator is running
-# BindsTo=sol.service
-
-[Service]
-Type=simple
-User=sol
-Group=sol
-ExecStart=/home/sol/bam-leader-activity/leader-capture-monitor.sh
-Restart=on-failure
-RestartSec=30
-
-# Logging
-StandardOutput=append:/home/sol/logs/leader-capture-monitor.log
-StandardError=append:/home/sol/logs/leader-capture-monitor.log
-
-# Environment (PATH for solana, agave-validator, jq, etc.)
-Environment="PATH=/home/sol/.local/share/solana/install/active_release/bin:/usr/local/bin:/usr/bin:/bin"
-
-[Install]
-WantedBy=multi-user.target
+```bash
+sudo cp /home/sol/bam-leader-activity/leader-capture-monitor.service /etc/systemd/system/
+sudo systemctl daemon-reload
 ```
+
+Key settings and the reasoning behind the non-obvious ones:
+
+| Setting | Value | Why |
+|---|---|---|
+| `After=network.target sol.service` | | Wait for network and the validator unit before launching. |
+| `Wants=sol.service` | | Soft dependency — if the validator unit isn't present the capture monitor still starts; if it restarts we don't get dragged down with it. |
+| `Restart=always` + `RestartSec=10` | | The monitor is a long-lived poll loop. Any exit is unexpected, so restart unconditionally with a short backoff. |
+| `User=sol` | | Runs as the validator user so it can reach `~/.config/validator/rpc.conf`, `~/validator.sh`, and the capture output directory. |
+| `Environment=PATH=...` | | Cron/systemd start with a minimal PATH; the script needs Solana CLI tools (`agave-validator`, `solana`, etc.) so we prepend the install dir. |
+| `ExecStart=/home/sol/bam-leader-activity/leader-capture-monitor.sh` | | Absolute path to the tracked script. |
+| `StandardOutput=null`, `StandardError=null` | | **Intentional, not a bug.** The script self-redirects to `~/logs/leader-capture-monitor.log` as its first action. Using `StandardOutput=append:` here causes a `wait`/`pipefail` FD-inheritance deadlock in bash subshells (see commit `98c7199`), so we route logging through the script instead. |
 
 ### Enable and start
 
 ```bash
-sudo systemctl daemon-reload
 sudo systemctl enable leader-capture-monitor
 sudo systemctl start leader-capture-monitor
 ```
@@ -186,6 +175,57 @@ Add a logrotate config at `/etc/logrotate.d/leader-capture-monitor`:
     notifempty
     copytruncate
 }
+```
+
+## Hourly Log Summary (cron)
+
+A separate cron entry drives [`hourly_log_error_summary.py`](hourly_log_error_summary.py), which runs at the top of every hour and produces a combined Discord report that includes a leader-slot earnings roll-up over the past hour.
+
+The script:
+
+- scans every `~/logs/*.log` file for genuine errors vs. tracked low-severity noise in the window
+- extracts BAM connectivity metrics and bundle/heartbeat counts from `validator.log`
+- iterates `captures/slot_txns_*.json` produced by `leader-capture-monitor.sh` in the window and rolls up leader fees, Jito tip revenue, total revenue, and tip anomaly counts
+- sends the merged report to Discord with an AI-generated severity assessment via the Claude API
+
+### Crontab entry
+
+```
+0 * * * * /home/sol/python/venv/bin/python3 /home/sol/bam-leader-activity/hourly_log_error_summary.py >> /home/sol/logs/hourly_log_summary.log 2>&1
+```
+
+Install with:
+
+```bash
+crontab -e
+# append the line above, save, exit
+```
+
+Notes on the specific invocation:
+
+- **Explicit interpreter path.** `/home/sol/python/venv/bin/python3` pins the Python interpreter to a venv that has `anthropic` and any other dependencies installed. The script's shebang points at the same venv, so executing the script directly would also work, but the explicit path makes the dependency visible in `crontab -l`.
+- **Absolute script path.** Cron always uses absolute paths — the script lives in this repo, so update the path if you clone to a different location.
+- **Stdout/stderr appended to a log.** Cron emails output by default; appending to `hourly_log_summary.log` keeps everything on disk and avoids noisy mail.
+
+### Prerequisites
+
+- `/home/sol/python/venv/bin/python3` — Python venv containing `anthropic` (or set up via `python3 -m venv /home/sol/python/venv && /home/sol/python/venv/bin/pip install anthropic`).
+- `~/.config/anthropic/api_key` or `ANTHROPIC_API_KEY` in the environment — required for AI summaries. If absent the script falls back to a raw error dump but still runs.
+- `~/.config/discord/webhook` — Discord webhook URL (same file the capture monitor uses).
+- `~/999_discord_embed.sh` — shared embed helper (see [Discord Notifications](README.md#discord-notifications)).
+- `leader-capture-monitor.service` running — without it, `captures/slot_txns_*.json` never gets written and the leader roll-up section is silently omitted from the hourly report.
+
+### Testing without waiting for cron
+
+```bash
+# Dry run — collects, analyzes, prints the embed to stdout, does NOT post to Discord
+/home/sol/python/venv/bin/python3 /home/sol/bam-leader-activity/hourly_log_error_summary.py --dry-run --verbose
+```
+
+If captures exist in the last hour, the log should include a line like:
+
+```
+Leader: N rotation(s), M txns, X.XXXXXX SOL fees + Y.YYYYYY SOL tips = Z.ZZZZZZ SOL revenue
 ```
 
 ## Troubleshooting
