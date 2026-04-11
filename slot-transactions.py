@@ -24,50 +24,91 @@ from collections import defaultdict
 # Load RPC URL from validator config
 VALIDATOR_CONFIG = os.path.expanduser("~/.config/validator/rpc.conf")
 DEFAULT_EXPLORER_URL = "https://solscan.io/tx"
+VALIDATOR_SH = os.environ.get("VALIDATOR_SH", os.path.expanduser("~/validator.sh"))
 
-# Jito tip accounts — destinations for bundle tip transfers.
-# Positive balance deltas on these accounts inside a leader slot = tips earned.
-JITO_TIP_ACCOUNTS = frozenset({
-    "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
-    "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
-    "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
-    "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
-    "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
-    "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
-    "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
-    "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
-})
+# Jito on-chain addresses per network. Source:
+# https://jito-foundation.gitbook.io/mev/mev-payment-and-distribution/on-chain-addresses
+# Testnet and mainnet use entirely different keys — never mix them.
+JITO_ADDRESSES = {
+    "mainnet": {
+        "tip_payment_program": "T1pyyaTNZsKv2WcRAB8oVnk93mLJw2XzjtVYqCsaHqt",
+        "tip_distribution_program": "4R3gSG8BpU4t19KYj8CfnbtRpnT8gtk4dvTHxVRwc2r7",
+        "merkle_upload_authority": "8F4jGUmxF36vQ6yabnsxX6AQVXdKBhs8kGSUuRKSg8Xt",
+        "tip_accounts": frozenset({
+            "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
+            "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
+            "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
+            "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
+            "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
+            "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
+            "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
+            "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
+        }),
+    },
+    "testnet": {
+        "tip_payment_program": "GJHtFqM9agxPmkeKjHny6qiRKrXZALvvFGiKf11QE7hy",
+        "tip_distribution_program": "DzvGET57TAgEDxvm3ERUM4GNcsAJdqjDLCne9sdfY4wf",
+        "merkle_upload_authority": "7T4inmPmtNBX3MhLwJ9hFsSMnGJYYkKioVABSNTWVRuS",
+        "tip_accounts": frozenset({
+            "BkMx5bRzQeP6tUZgzEs3xeDWJfQiLYvNDqSgmGZKYJDq",
+            "CwWZzvRgmxj9WLLhdoWUVrHZ1J8db3w2iptKuAitHqoC",
+            "4uRnem4BfVpZBv7kShVxUYtcipscgZMSHi3B9CSL6gAA",
+            "AzfhMPcx3qjbvCK3UUy868qmc5L451W341cpFqdL3EBe",
+            "84DrGKhycCUGfLzw8hXsUYX9SnWdh2wW3ozsTPrC5xyg",
+            "7aewvu8fMf1DK4fKoMXKfs3h3wpAQ7r7D8T1C71LmMF",
+            "G2d63CEgKBdgtpYT2BuheYQ9HFuFCenuHLNyKVpqAuSD",
+            "F7ThiQUBYiEcyaxpmMuUeACdoiSLKg4SZZ8JSfpFNwAf",
+        }),
+    },
+}
 
 
 def detect_network():
-    """Return 'mainnet' or 'testnet'. Honors NETWORK env override; otherwise
-    inspects validator.sh for the --entrypoint flag."""
-    override = os.environ.get("NETWORK")
-    if override:
-        if override not in ("mainnet", "testnet"):
-            print(f"Error: NETWORK must be 'mainnet' or 'testnet' (got '{override}')", file=sys.stderr)
-            sys.exit(1)
-        return override
+    """Pick mainnet/testnet via NETWORK env var, else parse VALIDATOR_SH.
 
-    validator_sh = os.environ.get("VALIDATOR_SH") or os.path.expanduser("~/validator.sh")
+    Mirrors detect-network.sh. Raises RuntimeError if the answer is
+    ambiguous rather than silently defaulting.
+    """
+    env = os.environ.get("NETWORK")
+    if env:
+        if env in ("mainnet", "testnet"):
+            return env
+        raise RuntimeError(
+            f"NETWORK env var is set to {env!r}; must be 'mainnet' or 'testnet'"
+        )
+
+    if not os.path.isfile(VALIDATOR_SH):
+        raise RuntimeError(
+            f"{VALIDATOR_SH} not found; set NETWORK=mainnet|testnet in the "
+            "environment to bypass detection"
+        )
+
     try:
-        with open(validator_sh) as f:
+        with open(VALIDATOR_SH) as f:
             contents = f.read()
-    except FileNotFoundError:
-        print(f"Error: cannot detect network — {validator_sh} not found (set NETWORK or VALIDATOR_SH)", file=sys.stderr)
-        sys.exit(1)
+    except OSError as e:
+        raise RuntimeError(f"Could not read {VALIDATOR_SH}: {e}") from e
 
-    if re.search(r"entrypoint[^ ]*\.testnet\.solana\.com", contents):
-        return "testnet"
-    if re.search(r"entrypoint[^ ]*\.mainnet-beta\.solana\.com", contents):
+    has_mainnet = bool(re.search(r"entrypoint\d*\.mainnet-beta\.solana\.com", contents))
+    has_testnet = bool(re.search(r"entrypoint\d*\.testnet\.solana\.com", contents))
+
+    if has_mainnet and not has_testnet:
         return "mainnet"
-    print(f"Error: could not determine network from {validator_sh}", file=sys.stderr)
-    sys.exit(1)
+    if has_testnet and not has_mainnet:
+        return "testnet"
+    if has_mainnet and has_testnet:
+        raise RuntimeError(
+            f"{VALIDATOR_SH} contains BOTH mainnet and testnet entrypoints; "
+            "set NETWORK=mainnet|testnet to disambiguate"
+        )
+    raise RuntimeError(
+        f"{VALIDATOR_SH} contains no recognizable --entrypoint flag; "
+        "set NETWORK=mainnet|testnet to bypass detection"
+    )
 
 
-def load_rpc_url():
-    """Load RPC URL from the shared validator config file, picking the key
-    that matches the detected network."""
+def _load_validator_config():
+    """Parse ~/.config/validator/rpc.conf into a dict. Internal helper."""
     config = {}
     try:
         with open(VALIDATOR_CONFIG) as f:
@@ -78,10 +119,17 @@ def load_rpc_url():
                 key, _, value = line.partition("=")
                 config[key.strip()] = value.strip().strip('"').strip("'")
     except FileNotFoundError:
+        return None
+    return config
+
+
+def load_rpc_url(network):
+    """Load the RPC URL for the given network from validator config."""
+    config = _load_validator_config()
+    if config is None:
         print(f"Error: Config not found: {VALIDATOR_CONFIG}", file=sys.stderr)
         sys.exit(1)
 
-    network = detect_network()
     key = "MAINNET_RPC_URL" if network == "mainnet" else "TESTNET_RPC_URL"
     rpc_url = config.get(key)
     if not rpc_url:
@@ -92,16 +140,8 @@ def load_rpc_url():
 
 def load_validator_identity():
     """Load validator identity from config."""
-    config = {}
-    try:
-        with open(VALIDATOR_CONFIG) as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("#") or "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                config[key.strip()] = value.strip().strip('"').strip("'")
-    except FileNotFoundError:
+    config = _load_validator_config()
+    if config is None:
         return None
     return config.get("VALIDATOR_IDENTITY")
 
@@ -161,8 +201,23 @@ def get_block(rpc_url, slot):
     return result.get("result")
 
 
-def extract_slot_data(rpc_url, slot):
-    """Extract transaction data from a single slot."""
+def extract_slot_data(rpc_url, slot, jito_cfg, validator_identity):
+    """Extract transaction data from a single slot.
+
+    Tip accounting:
+      - tips_in_lamports: sum of positive deltas into tip PDAs (gross inflow)
+      - self_drain_lamports: sum of outflows FROM tip PDAs in txns signed by
+        OUR validator_identity (i.e. us calling change_tip_receiver to sweep
+        tips into our own TipDistributionAccount — this is our tip revenue)
+      - tip_anomalies: withdrawals from tip PDAs signed by something that is
+        NOT a validator identity (neither ours nor any other). Other
+        validators' own sweeps landing in our block are silently ignored.
+        We can't distinguish "other validator identity" from "unknown" from
+        a single block alone, so we use a conservative heuristic: a txn is
+        treated as a legitimate sweep if it invokes the tip_payment_program
+        at all. Anything else touching a tip PDA with a negative delta is
+        anomalous.
+    """
     block = get_block(rpc_url, slot)
 
     if block is None:
@@ -171,6 +226,9 @@ def extract_slot_data(rpc_url, slot):
     if block.get("skipped"):
         return {"slot": slot, "skipped": True, "transactions": []}
 
+    tip_accounts = jito_cfg["tip_accounts"]
+    tip_payment_program = jito_cfg["tip_payment_program"]
+
     # Authoritative leader fee credit for this block (post-burn, priority + base share).
     # Taken from block.rewards[] where rewardType == "Fee".
     leader_fee_lamports = 0
@@ -178,7 +236,9 @@ def extract_slot_data(rpc_url, slot):
         if r.get("rewardType") == "Fee":
             leader_fee_lamports += r.get("lamports", 0)
 
-    tips_lamports = 0
+    tips_in_lamports = 0
+    self_drain_lamports = 0
+    tip_anomalies = []
 
     transactions = []
     for tx_wrapper in block.get("transactions", []):
@@ -201,14 +261,37 @@ def extract_slot_data(rpc_url, slot):
             + list(loaded.get("writable") or []) \
             + list(loaded.get("readonly") or [])
 
-        # Sum positive deltas into any Jito tip account in this txn.
+        # Fee payer / first signer — for change_tip_receiver txns this is the
+        # leader validator whose tips are being swept.
+        fee_payer = static_keys[0] if static_keys else None
+        invokes_tip_program = tip_payment_program in all_keys
+
         pre = meta.get("preBalances") or []
         post = meta.get("postBalances") or []
         for idx, key in enumerate(all_keys):
-            if key in JITO_TIP_ACCOUNTS and idx < len(pre) and idx < len(post):
-                delta = post[idx] - pre[idx]
-                if delta > 0:
-                    tips_lamports += delta
+            if key not in tip_accounts:
+                continue
+            if idx >= len(pre) or idx >= len(post):
+                continue
+            delta = post[idx] - pre[idx]
+            if delta > 0:
+                tips_in_lamports += delta
+            elif delta < 0:
+                if fee_payer == validator_identity:
+                    # Our own sweep — this is our tip revenue.
+                    self_drain_lamports += -delta
+                elif invokes_tip_program:
+                    # Another validator's sweep. Normal noise, ignore silently.
+                    pass
+                else:
+                    # Something touched a tip PDA and drained it WITHOUT
+                    # going through the tip payment program. Flag.
+                    tip_anomalies.append({
+                        "signature": sig,
+                        "fee_payer": fee_payer,
+                        "account": key,
+                        "lamports": delta,
+                    })
 
         is_vote = "Vote111111111111111111111111111111111111111" in static_keys
         if is_vote:
@@ -232,7 +315,12 @@ def extract_slot_data(rpc_url, slot):
         "transactions": transactions,
         "total_non_vote_txns": len(transactions),
         "leader_fee_lamports": leader_fee_lamports,
-        "tips_lamports": tips_lamports,
+        # Gross positive inflow into tip PDAs in this slot (informational).
+        "tips_in_lamports": tips_in_lamports,
+        # Outflow in txns signed by our identity = our tip revenue.
+        "self_drain_lamports": self_drain_lamports,
+        # Suspicious withdrawals we couldn't explain.
+        "tip_anomalies": tip_anomalies,
     }
 
 
@@ -241,17 +329,19 @@ def format_sol(lamports):
     return f"{lamports / 1e9:.6f}"
 
 
-def output_text(slots_data, explorer_url, validator_identity):
+def output_text(slots_data, explorer_url, validator_identity, network):
     """Output human-readable text format."""
     total_txns = 0
     total_success = 0
     total_failed = 0
     gross_fees_paid = 0
     leader_fees_earned = 0
-    total_tips = 0
+    total_tips_in = 0
+    total_self_drain = 0
     total_compute = 0
     skipped_slots = 0
     error_slots = 0
+    anomaly_events = []  # [(slot, anomaly), ...]
 
     for sd in slots_data:
         if sd.get("skipped"):
@@ -261,7 +351,10 @@ def output_text(slots_data, explorer_url, validator_identity):
             error_slots += 1
             continue
         leader_fees_earned += sd.get("leader_fee_lamports", 0)
-        total_tips += sd.get("tips_lamports", 0)
+        total_tips_in += sd.get("tips_in_lamports", 0)
+        total_self_drain += sd.get("self_drain_lamports", 0)
+        for a in sd.get("tip_anomalies") or []:
+            anomaly_events.append((sd["slot"], a))
         for tx in sd["transactions"]:
             total_txns += 1
             if tx["success"]:
@@ -272,10 +365,14 @@ def output_text(slots_data, explorer_url, validator_identity):
             total_compute += tx["compute_units"]
 
     active_slots = len(slots_data) - skipped_slots - error_slots
+    # Authoritative tip revenue: sum of outflows in txns we signed.
+    tip_revenue = total_self_drain
+    total_revenue = leader_fees_earned + tip_revenue
 
     print(f"\n{'LEADER SLOT TRANSACTION REPORT':=^100}")
     if validator_identity:
         print(f"Validator: {validator_identity}")
+    print(f"Network:   {network}")
     first_slot = slots_data[0]["slot"]
     last_slot = slots_data[-1]["slot"]
     print(f"Slots: {first_slot}–{last_slot} ({len(slots_data)} total, {active_slots} produced, {skipped_slots} skipped)")
@@ -284,9 +381,18 @@ def output_text(slots_data, explorer_url, validator_identity):
     print(f"  Successful: {total_success:,}")
     print(f"  Failed: {total_failed:,}")
     print(f"  Fees earned (leader credit): {format_sol(leader_fees_earned)} SOL ({leader_fees_earned:,} lamports)")
-    print(f"  Jito tips received:          {format_sol(total_tips)} SOL ({total_tips:,} lamports)")
-    print(f"  Total leader revenue:        {format_sol(leader_fees_earned + total_tips)} SOL")
+    print(f"  Jito tip revenue (self-drain): {format_sol(tip_revenue)} SOL ({tip_revenue:,} lamports)")
+    print(f"  Total leader revenue:        {format_sol(total_revenue)} SOL")
+    print(f"  Tip inflow (informational): {format_sol(total_tips_in)} SOL "
+          "(gross deposits into tip PDAs; our revenue is the self-drain above)")
     print(f"  Gross fees paid (non-vote):  {format_sol(gross_fees_paid)} SOL ({gross_fees_paid:,} lamports)")
+    if anomaly_events:
+        total_anomaly = sum(-a["lamports"] for _, a in anomaly_events)
+        print(f"  ⚠️  Tip anomalies: {len(anomaly_events)} event(s), "
+              f"{format_sol(total_anomaly)} SOL drained outside tip_payment_program")
+        for slot, a in anomaly_events:
+            print(f"      slot {slot}: {format_sol(-a['lamports'])} SOL from {a['account']} "
+                  f"(payer {a['fee_payer']}, sig {a['signature']})")
     print(f"  Total compute units: {total_compute:,}")
     if total_txns > 0:
         print(f"  Avg fee per txn: {format_sol(gross_fees_paid // total_txns)} SOL")
@@ -294,25 +400,25 @@ def output_text(slots_data, explorer_url, validator_identity):
 
     # Per-slot breakdown
     print(f"\n{'-' * 120}")
-    print(f"{'Slot':<14} | {'Status':<7} | {'Txns':>6} | {'OK':>6} | {'Fail':>5} | {'Fees (SOL)':>12} | {'Tips (SOL)':>12} | {'Compute':>12}")
+    print(f"{'Slot':<14} | {'Status':<7} | {'Txns':>6} | {'OK':>6} | {'Fail':>5} | {'Fees (SOL)':>12} | {'Tip Rev (SOL)':>14} | {'Compute':>12}")
     print(f"{'-' * 120}")
 
     for sd in slots_data:
         slot = sd["slot"]
         if sd.get("skipped"):
-            print(f"{slot:<14} | {'SKIPPED':<7} | {'-':>6} | {'-':>6} | {'-':>5} | {'-':>12} | {'-':>12} | {'-':>12}")
+            print(f"{slot:<14} | {'SKIPPED':<7} | {'-':>6} | {'-':>6} | {'-':>5} | {'-':>12} | {'-':>14} | {'-':>12}")
             continue
         if sd.get("error"):
-            print(f"{slot:<14} | {'ERROR':<7} | {'-':>6} | {'-':>6} | {'-':>5} | {'-':>12} | {'-':>12} | {'-':>12}")
+            print(f"{slot:<14} | {'ERROR':<7} | {'-':>6} | {'-':>6} | {'-':>5} | {'-':>12} | {'-':>14} | {'-':>12}")
             continue
 
         txns = sd["transactions"]
         n_success = sum(1 for t in txns if t["success"])
         n_failed = sum(1 for t in txns if not t["success"])
         earned = sd.get("leader_fee_lamports", 0)
-        tips = sd.get("tips_lamports", 0)
+        tip_rev = sd.get("self_drain_lamports", 0)
         compute = sum(t["compute_units"] for t in txns)
-        print(f"{slot:<14} | {'OK':<7} | {len(txns):>6} | {n_success:>6} | {n_failed:>5} | {format_sol(earned):>12} | {format_sol(tips):>12} | {compute:>12,}")
+        print(f"{slot:<14} | {'OK':<7} | {len(txns):>6} | {n_success:>6} | {n_failed:>5} | {format_sol(earned):>12} | {format_sol(tip_rev):>14} | {compute:>12,}")
 
     print(f"{'=' * 100}")
 
@@ -341,15 +447,17 @@ def output_text(slots_data, explorer_url, validator_identity):
     print(f"{'=' * 100}")
 
 
-def output_json(slots_data, explorer_url, validator_identity):
+def output_json(slots_data, explorer_url, validator_identity, network):
     """Output JSON format."""
     total_txns = 0
     total_success = 0
     total_failed = 0
     gross_fees_paid = 0
     leader_fees_earned = 0
-    total_tips = 0
+    total_tips_in = 0
+    total_self_drain = 0
     skipped_slots = 0
+    anomalies_flat = []
 
     for sd in slots_data:
         if sd.get("skipped"):
@@ -358,7 +466,10 @@ def output_json(slots_data, explorer_url, validator_identity):
         if sd.get("error"):
             continue
         leader_fees_earned += sd.get("leader_fee_lamports", 0)
-        total_tips += sd.get("tips_lamports", 0)
+        total_tips_in += sd.get("tips_in_lamports", 0)
+        total_self_drain += sd.get("self_drain_lamports", 0)
+        for a in sd.get("tip_anomalies") or []:
+            anomalies_flat.append({"slot": sd["slot"], **a})
         for tx in sd["transactions"]:
             total_txns += 1
             gross_fees_paid += tx["fee"]
@@ -367,8 +478,13 @@ def output_json(slots_data, explorer_url, validator_identity):
             else:
                 total_failed += 1
 
+    anomaly_lamports = sum(-a["lamports"] for a in anomalies_flat)
+    tip_revenue = total_self_drain
+    total_revenue = leader_fees_earned + tip_revenue
+
     output = {
         "validator": validator_identity,
+        "network": network,
         "summary": {
             "first_slot": slots_data[0]["slot"],
             "last_slot": slots_data[-1]["slot"],
@@ -380,16 +496,31 @@ def output_json(slots_data, explorer_url, validator_identity):
             # Authoritative leader credit from block.rewards[] (post-burn).
             "total_fees_lamports": leader_fees_earned,
             "total_fees_sol": leader_fees_earned / 1e9,
-            # Jito tips: positive balance deltas into the 8 Jito tip accounts
-            # summed across all txns in the captured slots.
-            "total_tips_lamports": total_tips,
-            "total_tips_sol": total_tips / 1e9,
-            "total_revenue_lamports": leader_fees_earned + total_tips,
-            "total_revenue_sol": (leader_fees_earned + total_tips) / 1e9,
+            # Authoritative tip revenue: outflows from tip PDAs in txns
+            # signed by our validator identity (change_tip_receiver sweeps).
+            # Back-compat: keep the `total_tips_*` field names so downstream
+            # readers (hourly summary, leader-capture-monitor.sh) don't break.
+            "total_tips_lamports": tip_revenue,
+            "total_tips_sol": tip_revenue / 1e9,
+            "total_revenue_lamports": total_revenue,
+            "total_revenue_sol": total_revenue / 1e9,
+            # Informational: gross deposits INTO tip PDAs (not our revenue —
+            # see self_drain above for that — but useful for context).
+            "tip_inflow_lamports": total_tips_in,
+            "tip_inflow_sol": total_tips_in / 1e9,
+            # Suspicious withdrawals we couldn't attribute. Should be 0.
+            "tip_anomaly_count": len(anomalies_flat),
+            "tip_anomaly_lamports": anomaly_lamports,
+            "tip_anomaly_sol": anomaly_lamports / 1e9,
+            # Legacy field names for shell-script back-compat:
+            "tip_withdrawal_count": len(anomalies_flat),
+            "tip_withdrawal_lamports": anomaly_lamports,
+            "tip_withdrawal_sol": anomaly_lamports / 1e9,
             # Gross fees paid by users (pre-burn, non-vote only) for comparison.
             "gross_fees_paid_lamports": gross_fees_paid,
             "gross_fees_paid_sol": gross_fees_paid / 1e9,
         },
+        "tip_anomalies": anomalies_flat,
         "explorer_url": explorer_url,
         "slots": slots_data,
     }
@@ -437,16 +568,23 @@ def main():
         print("Error: --slots FIRST LAST is required", file=sys.stderr)
         sys.exit(1)
 
-    rpc_url = rpc_url_override or load_rpc_url()
+    try:
+        network = detect_network()
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    jito_cfg = JITO_ADDRESSES[network]
+    rpc_url = rpc_url_override or load_rpc_url(network)
     validator_identity = load_validator_identity()
 
     slots = list(range(first_slot, last_slot + 1))
-    print(f"Querying {len(slots)} slots ({first_slot}–{last_slot})...", file=sys.stderr)
+    print(f"Querying {len(slots)} slots ({first_slot}–{last_slot}) on {network}...", file=sys.stderr)
 
     slots_data = []
     for slot in slots:
         print(f"  Slot {slot}...", file=sys.stderr, end="", flush=True)
-        sd = extract_slot_data(rpc_url, slot)
+        sd = extract_slot_data(rpc_url, slot, jito_cfg, validator_identity)
         slots_data.append(sd)
         if sd.get("skipped"):
             print(" skipped", file=sys.stderr)
@@ -459,9 +597,9 @@ def main():
             time.sleep(0.1)
 
     if output_format == "json":
-        output_json(slots_data, explorer_url, validator_identity)
+        output_json(slots_data, explorer_url, validator_identity, network)
     else:
-        output_text(slots_data, explorer_url, validator_identity)
+        output_text(slots_data, explorer_url, validator_identity, network)
 
 
 if __name__ == "__main__":

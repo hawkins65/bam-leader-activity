@@ -41,16 +41,21 @@ source "$VALIDATOR_CONFIG"
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 OUTPUT_DIR="$SCRIPT_DIR/captures"
 
+# Detect mainnet vs testnet from ~/validator.sh (or $NETWORK override).
+# Exported so child processes (slot-transactions.py) skip re-parsing.
 # shellcheck source=detect-network.sh
 source "$SCRIPT_DIR/detect-network.sh"
 NETWORK="$(detect_network)" || exit 1
 export NETWORK
 
 case "$NETWORK" in
-    mainnet) RPC_URL="${MAINNET_RPC_URL:?MAINNET_RPC_URL not set in $VALIDATOR_CONFIG}" ;;
-    testnet) RPC_URL="${TESTNET_RPC_URL:?TESTNET_RPC_URL not set in $VALIDATOR_CONFIG}" ;;
+    mainnet)
+        RPC_URL="${MAINNET_RPC_URL:?MAINNET_RPC_URL not set in $VALIDATOR_CONFIG}"
+        ;;
+    testnet)
+        RPC_URL="${TESTNET_RPC_URL:?TESTNET_RPC_URL not set in $VALIDATOR_CONFIG}"
+        ;;
 esac
-
 VALIDATOR_IDENTITY="${VALIDATOR_IDENTITY:?VALIDATOR_IDENTITY not set in $VALIDATOR_CONFIG}"
 
 # Timing configuration
@@ -251,11 +256,17 @@ print(
     f\"{d.get('total_fees_sol', 0):.6f}\",
     f\"{d.get('total_tips_sol', 0):.6f}\",
     f\"{d.get('total_revenue_sol', 0):.6f}\",
+    d.get('tip_withdrawal_count', 0),
+    f\"{d.get('tip_withdrawal_sol', 0):.6f}\",
 )
 " 2>/dev/null)
 
-    local total_txns success_count failed_count skipped_slots total_fees_sol total_tips_sol total_revenue_sol
-    read -r total_txns success_count failed_count skipped_slots total_fees_sol total_tips_sol total_revenue_sol <<< "$summary_line"
+    local total_txns success_count failed_count skipped_slots
+    local total_fees_sol total_tips_sol total_revenue_sol
+    local withdrawal_count withdrawal_sol
+    read -r total_txns success_count failed_count skipped_slots \
+            total_fees_sol total_tips_sol total_revenue_sol \
+            withdrawal_count withdrawal_sol <<< "$summary_line"
 
     total_txns="${total_txns:-0}"
     success_count="${success_count:-0}"
@@ -264,6 +275,8 @@ print(
     total_fees_sol="${total_fees_sol:-0}"
     total_tips_sol="${total_tips_sol:-0}"
     total_revenue_sol="${total_revenue_sol:-0}"
+    withdrawal_count="${withdrawal_count:-0}"
+    withdrawal_sol="${withdrawal_sol:-0}"
 
     local capture_duration=$(( capture_end_time - capture_start_time ))
     local slot_range="${first_slot}–${last_slot}"
@@ -280,6 +293,9 @@ print(
     if (( total_txns == 0 )); then
         severity="warning"
     fi
+    if (( withdrawal_count > 0 )); then
+        severity="warning"
+    fi
 
     local desc=""
     desc+="**Slots:** ${slot_range} (${total_slots} slots across ${group_label})"
@@ -291,11 +307,16 @@ print(
     desc+=$'\n'"**Fees earned:** ${total_fees_sol} SOL"
     desc+=$'\n'"**Jito tips:** ${total_tips_sol} SOL"
     desc+=$'\n'"**Total revenue:** ${total_revenue_sol} SOL"
+    if (( withdrawal_count > 0 )); then
+        desc+=$'\n'"⚠️ **Tip account withdrawals:** ${withdrawal_count} event(s), ${withdrawal_sol} SOL out — see ${text_file}"
+    fi
     desc+=$'\n'"**Output:** ${text_file}"
 
     local title="Leader Slot Report"
     if (( total_txns == 0 )); then
         title="Leader Slot Report — No Transactions"
+    elif (( withdrawal_count > 0 )); then
+        title="Leader Slot Report — ⚠️ Tip Withdrawal Detected"
     fi
 
     send_discord "$title" "$desc" "$severity"
@@ -309,6 +330,9 @@ print(
     log "  Fees: $total_fees_sol SOL"
     log "  Tips: $total_tips_sol SOL"
     log "  Revenue: $total_revenue_sol SOL"
+    if (( withdrawal_count > 0 )); then
+        log "  ⚠️  Tip withdrawals: $withdrawal_count event(s), $withdrawal_sol SOL out"
+    fi
     log "  Output: $text_file"
 }
 
@@ -453,6 +477,7 @@ run_capture_cycle() {
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 log "Leader Capture Monitor starting (RPC mode)"
+log "  Network: $NETWORK"
 log "  Validator: $VALIDATOR_IDENTITY"
 log "  RPC: ${RPC_URL%%://*}://***${RPC_URL##*/}"
 log "  Post-slot buffer: ${BUFFER_AFTER_SECONDS}s (wait for block finalization)"
