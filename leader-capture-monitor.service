@@ -1,0 +1,17 @@
+[Unit]
+Description=Leader Slot Bundle Capture Monitor
+After=network.target sol.service
+Wants=sol.service
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=10
+User=sol
+Environment=PATH=/home/sol/.local/share/solana/install/active_release/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/home/sol/bam-leader-activity/leader-capture-monitor.sh
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=multi-user.target
