@@ -24,6 +24,19 @@ from collections import defaultdict
 VALIDATOR_CONFIG = os.path.expanduser("~/.config/validator/rpc.conf")
 DEFAULT_EXPLORER_URL = "https://solscan.io/tx"
 
+# Jito tip accounts — destinations for bundle tip transfers.
+# Positive balance deltas on these accounts inside a leader slot = tips earned.
+JITO_TIP_ACCOUNTS = frozenset({
+    "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
+    "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
+    "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
+    "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
+    "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
+    "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
+    "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
+    "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
+})
+
 
 def load_rpc_url():
     """Load RPC URL from the shared validator config file."""
@@ -99,7 +112,7 @@ def get_block(rpc_url, slot):
         {
             "encoding": "json",
             "transactionDetails": "full",
-            "rewards": False,
+            "rewards": True,
             "maxSupportedTransactionVersion": 0,
         },
     ])
@@ -128,6 +141,15 @@ def extract_slot_data(rpc_url, slot):
     if block.get("skipped"):
         return {"slot": slot, "skipped": True, "transactions": []}
 
+    # Authoritative leader fee credit for this block (post-burn, priority + base share).
+    # Taken from block.rewards[] where rewardType == "Fee".
+    leader_fee_lamports = 0
+    for r in block.get("rewards") or []:
+        if r.get("rewardType") == "Fee":
+            leader_fee_lamports += r.get("lamports", 0)
+
+    tips_lamports = 0
+
     transactions = []
     for tx_wrapper in block.get("transactions", []):
         tx = tx_wrapper.get("transaction", {})
@@ -141,10 +163,24 @@ def extract_slot_data(rpc_url, slot):
         err = meta.get("err")
         fee = meta.get("fee", 0)
 
-        # Check if this is a vote transaction
-        account_keys = tx.get("message", {}).get("accountKeys", [])
-        is_vote = "Vote111111111111111111111111111111111111111" in account_keys
+        # Build full account key list (static + loaded from ALT) so indices
+        # align with pre/postBalances. Order: static, loaded writable, loaded readonly.
+        static_keys = tx.get("message", {}).get("accountKeys", []) or []
+        loaded = meta.get("loadedAddresses") or {}
+        all_keys = list(static_keys) \
+            + list(loaded.get("writable") or []) \
+            + list(loaded.get("readonly") or [])
 
+        # Sum positive deltas into any Jito tip account in this txn.
+        pre = meta.get("preBalances") or []
+        post = meta.get("postBalances") or []
+        for idx, key in enumerate(all_keys):
+            if key in JITO_TIP_ACCOUNTS and idx < len(pre) and idx < len(post):
+                delta = post[idx] - pre[idx]
+                if delta > 0:
+                    tips_lamports += delta
+
+        is_vote = "Vote111111111111111111111111111111111111111" in static_keys
         if is_vote:
             continue
 
@@ -165,6 +201,8 @@ def extract_slot_data(rpc_url, slot):
         "parent_slot": block.get("parentSlot"),
         "transactions": transactions,
         "total_non_vote_txns": len(transactions),
+        "leader_fee_lamports": leader_fee_lamports,
+        "tips_lamports": tips_lamports,
     }
 
 
@@ -178,7 +216,9 @@ def output_text(slots_data, explorer_url, validator_identity):
     total_txns = 0
     total_success = 0
     total_failed = 0
-    total_fees = 0
+    gross_fees_paid = 0
+    leader_fees_earned = 0
+    total_tips = 0
     total_compute = 0
     skipped_slots = 0
     error_slots = 0
@@ -190,13 +230,15 @@ def output_text(slots_data, explorer_url, validator_identity):
         if sd.get("error"):
             error_slots += 1
             continue
+        leader_fees_earned += sd.get("leader_fee_lamports", 0)
+        total_tips += sd.get("tips_lamports", 0)
         for tx in sd["transactions"]:
             total_txns += 1
             if tx["success"]:
                 total_success += 1
             else:
                 total_failed += 1
-            total_fees += tx["fee"]
+            gross_fees_paid += tx["fee"]
             total_compute += tx["compute_units"]
 
     active_slots = len(slots_data) - skipped_slots - error_slots
@@ -211,32 +253,36 @@ def output_text(slots_data, explorer_url, validator_identity):
     print(f"  Total non-vote transactions: {total_txns:,}")
     print(f"  Successful: {total_success:,}")
     print(f"  Failed: {total_failed:,}")
-    print(f"  Total fees: {format_sol(total_fees)} SOL ({total_fees:,} lamports)")
+    print(f"  Fees earned (leader credit): {format_sol(leader_fees_earned)} SOL ({leader_fees_earned:,} lamports)")
+    print(f"  Jito tips received:          {format_sol(total_tips)} SOL ({total_tips:,} lamports)")
+    print(f"  Total leader revenue:        {format_sol(leader_fees_earned + total_tips)} SOL")
+    print(f"  Gross fees paid (non-vote):  {format_sol(gross_fees_paid)} SOL ({gross_fees_paid:,} lamports)")
     print(f"  Total compute units: {total_compute:,}")
     if total_txns > 0:
-        print(f"  Avg fee per txn: {format_sol(total_fees // total_txns)} SOL")
+        print(f"  Avg fee per txn: {format_sol(gross_fees_paid // total_txns)} SOL")
         print(f"  Avg compute per txn: {total_compute // total_txns:,} CU")
 
     # Per-slot breakdown
-    print(f"\n{'-' * 100}")
-    print(f"{'Slot':<14} | {'Status':<10} | {'Txns':>6} | {'Success':>7} | {'Failed':>6} | {'Fees (SOL)':>14} | {'Compute':>12}")
-    print(f"{'-' * 100}")
+    print(f"\n{'-' * 120}")
+    print(f"{'Slot':<14} | {'Status':<7} | {'Txns':>6} | {'OK':>6} | {'Fail':>5} | {'Fees (SOL)':>12} | {'Tips (SOL)':>12} | {'Compute':>12}")
+    print(f"{'-' * 120}")
 
     for sd in slots_data:
         slot = sd["slot"]
         if sd.get("skipped"):
-            print(f"{slot:<14} | {'SKIPPED':<10} | {'-':>6} | {'-':>7} | {'-':>6} | {'-':>14} | {'-':>12}")
+            print(f"{slot:<14} | {'SKIPPED':<7} | {'-':>6} | {'-':>6} | {'-':>5} | {'-':>12} | {'-':>12} | {'-':>12}")
             continue
         if sd.get("error"):
-            print(f"{slot:<14} | {'ERROR':<10} | {'-':>6} | {'-':>7} | {'-':>6} | {'-':>14} | {'-':>12}")
+            print(f"{slot:<14} | {'ERROR':<7} | {'-':>6} | {'-':>6} | {'-':>5} | {'-':>12} | {'-':>12} | {'-':>12}")
             continue
 
         txns = sd["transactions"]
         n_success = sum(1 for t in txns if t["success"])
         n_failed = sum(1 for t in txns if not t["success"])
-        fees = sum(t["fee"] for t in txns)
+        earned = sd.get("leader_fee_lamports", 0)
+        tips = sd.get("tips_lamports", 0)
         compute = sum(t["compute_units"] for t in txns)
-        print(f"{slot:<14} | {'OK':<10} | {len(txns):>6} | {n_success:>7} | {n_failed:>6} | {format_sol(fees):>14} | {compute:>12,}")
+        print(f"{slot:<14} | {'OK':<7} | {len(txns):>6} | {n_success:>6} | {n_failed:>5} | {format_sol(earned):>12} | {format_sol(tips):>12} | {compute:>12,}")
 
     print(f"{'=' * 100}")
 
@@ -270,7 +316,9 @@ def output_json(slots_data, explorer_url, validator_identity):
     total_txns = 0
     total_success = 0
     total_failed = 0
-    total_fees = 0
+    gross_fees_paid = 0
+    leader_fees_earned = 0
+    total_tips = 0
     skipped_slots = 0
 
     for sd in slots_data:
@@ -279,9 +327,11 @@ def output_json(slots_data, explorer_url, validator_identity):
             continue
         if sd.get("error"):
             continue
+        leader_fees_earned += sd.get("leader_fee_lamports", 0)
+        total_tips += sd.get("tips_lamports", 0)
         for tx in sd["transactions"]:
             total_txns += 1
-            total_fees += tx["fee"]
+            gross_fees_paid += tx["fee"]
             if tx["success"]:
                 total_success += 1
             else:
@@ -297,8 +347,18 @@ def output_json(slots_data, explorer_url, validator_identity):
             "total_non_vote_transactions": total_txns,
             "successful": total_success,
             "failed": total_failed,
-            "total_fees_lamports": total_fees,
-            "total_fees_sol": total_fees / 1e9,
+            # Authoritative leader credit from block.rewards[] (post-burn).
+            "total_fees_lamports": leader_fees_earned,
+            "total_fees_sol": leader_fees_earned / 1e9,
+            # Jito tips: positive balance deltas into the 8 Jito tip accounts
+            # summed across all txns in the captured slots.
+            "total_tips_lamports": total_tips,
+            "total_tips_sol": total_tips / 1e9,
+            "total_revenue_lamports": leader_fees_earned + total_tips,
+            "total_revenue_sol": (leader_fees_earned + total_tips) / 1e9,
+            # Gross fees paid by users (pre-burn, non-vote only) for comparison.
+            "gross_fees_paid_lamports": gross_fees_paid,
+            "gross_fees_paid_sol": gross_fees_paid / 1e9,
         },
         "explorer_url": explorer_url,
         "slots": slots_data,

@@ -229,19 +229,32 @@ extract_and_report() {
     "$SLOT_TRANSACTIONS_SCRIPT" --slots "$first_slot" "$last_slot" > "$text_file" 2>/dev/null
     "$SLOT_TRANSACTIONS_SCRIPT" --slots "$first_slot" "$last_slot" --json > "$json_file" 2>/dev/null
 
-    # Parse summary from JSON output
-    local total_txns success_count failed_count total_fees_sol skipped_slots
-    total_txns=$(python3 -c "import json; d=json.load(open('$json_file')); print(d['summary']['total_non_vote_transactions'])" 2>/dev/null)
-    success_count=$(python3 -c "import json; d=json.load(open('$json_file')); print(d['summary']['successful'])" 2>/dev/null)
-    failed_count=$(python3 -c "import json; d=json.load(open('$json_file')); print(d['summary']['failed'])" 2>/dev/null)
-    total_fees_sol=$(python3 -c "import json; d=json.load(open('$json_file')); print(f\"{d['summary']['total_fees_sol']:.6f}\")" 2>/dev/null)
-    skipped_slots=$(python3 -c "import json; d=json.load(open('$json_file')); print(d['summary']['skipped_slots'])" 2>/dev/null)
+    # Parse summary from JSON output (one python invocation, not five)
+    local summary_line
+    summary_line=$(python3 -c "
+import json
+d = json.load(open('$json_file'))['summary']
+print(
+    d.get('total_non_vote_transactions', 0),
+    d.get('successful', 0),
+    d.get('failed', 0),
+    d.get('skipped_slots', 0),
+    f\"{d.get('total_fees_sol', 0):.6f}\",
+    f\"{d.get('total_tips_sol', 0):.6f}\",
+    f\"{d.get('total_revenue_sol', 0):.6f}\",
+)
+" 2>/dev/null)
+
+    local total_txns success_count failed_count skipped_slots total_fees_sol total_tips_sol total_revenue_sol
+    read -r total_txns success_count failed_count skipped_slots total_fees_sol total_tips_sol total_revenue_sol <<< "$summary_line"
 
     total_txns="${total_txns:-0}"
     success_count="${success_count:-0}"
     failed_count="${failed_count:-0}"
-    total_fees_sol="${total_fees_sol:-0}"
     skipped_slots="${skipped_slots:-0}"
+    total_fees_sol="${total_fees_sol:-0}"
+    total_tips_sol="${total_tips_sol:-0}"
+    total_revenue_sol="${total_revenue_sol:-0}"
 
     local capture_duration=$(( capture_end_time - capture_start_time ))
     local slot_range="${first_slot}–${last_slot}"
@@ -267,6 +280,8 @@ extract_and_report() {
     desc+=$'\n'"**Capture window:** $(duration_fmt $capture_duration)"
     desc+=$'\n'"**Transactions:** ${total_txns} (${success_count} success, ${failed_count} failed)"
     desc+=$'\n'"**Fees earned:** ${total_fees_sol} SOL"
+    desc+=$'\n'"**Jito tips:** ${total_tips_sol} SOL"
+    desc+=$'\n'"**Total revenue:** ${total_revenue_sol} SOL"
     desc+=$'\n'"**Output:** ${text_file}"
 
     local title="Leader Slot Report"
@@ -283,6 +298,8 @@ extract_and_report() {
     log "  Duration: $(duration_fmt $capture_duration)"
     log "  Transactions: $total_txns ($success_count success, $failed_count failed)"
     log "  Fees: $total_fees_sol SOL"
+    log "  Tips: $total_tips_sol SOL"
+    log "  Revenue: $total_revenue_sol SOL"
     log "  Output: $text_file"
 }
 
