@@ -14,6 +14,7 @@ Usage:
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -38,8 +39,35 @@ JITO_TIP_ACCOUNTS = frozenset({
 })
 
 
+def detect_network():
+    """Return 'mainnet' or 'testnet'. Honors NETWORK env override; otherwise
+    inspects validator.sh for the --entrypoint flag."""
+    override = os.environ.get("NETWORK")
+    if override:
+        if override not in ("mainnet", "testnet"):
+            print(f"Error: NETWORK must be 'mainnet' or 'testnet' (got '{override}')", file=sys.stderr)
+            sys.exit(1)
+        return override
+
+    validator_sh = os.environ.get("VALIDATOR_SH") or os.path.expanduser("~/validator.sh")
+    try:
+        with open(validator_sh) as f:
+            contents = f.read()
+    except FileNotFoundError:
+        print(f"Error: cannot detect network — {validator_sh} not found (set NETWORK or VALIDATOR_SH)", file=sys.stderr)
+        sys.exit(1)
+
+    if re.search(r"entrypoint[^ ]*\.testnet\.solana\.com", contents):
+        return "testnet"
+    if re.search(r"entrypoint[^ ]*\.mainnet-beta\.solana\.com", contents):
+        return "mainnet"
+    print(f"Error: could not determine network from {validator_sh}", file=sys.stderr)
+    sys.exit(1)
+
+
 def load_rpc_url():
-    """Load RPC URL from the shared validator config file."""
+    """Load RPC URL from the shared validator config file, picking the key
+    that matches the detected network."""
     config = {}
     try:
         with open(VALIDATOR_CONFIG) as f:
@@ -53,9 +81,11 @@ def load_rpc_url():
         print(f"Error: Config not found: {VALIDATOR_CONFIG}", file=sys.stderr)
         sys.exit(1)
 
-    rpc_url = config.get("MAINNET_RPC_URL")
+    network = detect_network()
+    key = "MAINNET_RPC_URL" if network == "mainnet" else "TESTNET_RPC_URL"
+    rpc_url = config.get(key)
     if not rpc_url:
-        print(f"Error: MAINNET_RPC_URL not set in {VALIDATOR_CONFIG}", file=sys.stderr)
+        print(f"Error: {key} not set in {VALIDATOR_CONFIG}", file=sys.stderr)
         sys.exit(1)
     return rpc_url
 

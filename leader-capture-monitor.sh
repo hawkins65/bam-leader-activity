@@ -38,11 +38,20 @@ fi
 # shellcheck source=/home/sol/.config/validator/rpc.conf
 source "$VALIDATOR_CONFIG"
 
-RPC_URL="${MAINNET_RPC_URL:?MAINNET_RPC_URL not set in $VALIDATOR_CONFIG}"
-VALIDATOR_IDENTITY="${VALIDATOR_IDENTITY:?VALIDATOR_IDENTITY not set in $VALIDATOR_CONFIG}"
-
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 OUTPUT_DIR="$SCRIPT_DIR/captures"
+
+# shellcheck source=detect-network.sh
+source "$SCRIPT_DIR/detect-network.sh"
+NETWORK="$(detect_network)" || exit 1
+export NETWORK
+
+case "$NETWORK" in
+    mainnet) RPC_URL="${MAINNET_RPC_URL:?MAINNET_RPC_URL not set in $VALIDATOR_CONFIG}" ;;
+    testnet) RPC_URL="${TESTNET_RPC_URL:?TESTNET_RPC_URL not set in $VALIDATOR_CONFIG}" ;;
+esac
+
+VALIDATOR_IDENTITY="${VALIDATOR_IDENTITY:?VALIDATOR_IDENTITY not set in $VALIDATOR_CONFIG}"
 
 # Timing configuration
 BUFFER_AFTER_SECONDS=60     # Wait this long after last slot before querying RPC
