@@ -21,6 +21,7 @@ STATE_DIR="$HOME/.log_monitor/bam"
 OFFSET_DIR="$STATE_DIR/offsets"
 HASH_DIR="$STATE_DIR/hashes"
 DATE_FILE="$STATE_DIR/last_reset_date"
+METRIC_START_FILE="$STATE_DIR/metric_anomaly_start"
 
 ONCE=false
 VERBOSE=false
@@ -30,7 +31,8 @@ LOOP_INTERVAL=60
 # Failover configuration
 FAILOVER_DIR="$STATE_DIR/failover"
 VALIDATOR_SH="/home/sol/validator.sh"
-ADMIN_RPC="/mnt/ledger/admin.rpc"
+LEDGER_DIR="/mnt/ledger"
+ADMIN_RPC="${LEDGER_DIR}/admin.rpc"
 # Auto-detect network and regions from validator.sh --bam-url
 NETWORK=""
 REGIONS=""
@@ -42,11 +44,11 @@ if [[ -n "$_bam_url" ]]; then
     NETWORK=$(echo "$_bam_url" | sed -E 's|https?://[^.]+\.([^.]+)\..*|\1|')
 fi
 case "$NETWORK" in
-    mainnet) REGIONS="amsterdam dublin dallas frankfurt london lax ny pittsburgh slc singapore tokyo" ;;
+    mainnet) REGIONS="ams-1 amsterdam dublin dallas frankfurt london lax ny pittsburgh slc singapore tokyo" ;;
     testnet) REGIONS="dallas ny slc" ;;
 esac
 FAIL_THRESHOLD=2
-RECOVERY_THRESHOLD=2
+RECOVERY_THRESHOLD=1
 FO_PING_COUNT=5
 FO_PING_TIMEOUT=2
 
@@ -55,6 +57,8 @@ BAM_CONNECTION_PATTERN='BAM connection lost|BAM connection not healthy|Failed to
 
 # BAM metric anomaly patterns (non-zero counts for failure metrics)
 BAM_METRIC_PATTERN='unhealthy_connection_count=[1-9]|outbound_fail=[1-9]|bundle_forward_to_scheduler_fail=[1-9]'
+# Minimum sustained duration (seconds) before metric anomalies trigger an alert
+BAM_METRIC_MIN_DURATION=10
 
 usage() {
     echo "Usage: $0 [--once] [--verbose] [--reset]"
@@ -271,6 +275,16 @@ select_best_region() {
 
 apply_bam_switch() {
     local url="$1"
+
+    # Method 1: agave-validator CLI (preferred)
+    local cli_out
+    if cli_out=$(agave-validator --ledger "$LEDGER_DIR" set-bam-config --bam-url "$url" 2>&1); then
+        debug "setBamUrl via CLI: $cli_out"
+        return 0
+    fi
+    log "WARNING: agave-validator CLI failed: $cli_out — trying socat fallback"
+
+    # Method 2: socat to admin.rpc (fallback)
     if [[ ! -S "$ADMIN_RPC" ]]; then
         log "ERROR: Admin RPC socket not found at $ADMIN_RPC"
         return 1
@@ -287,7 +301,7 @@ apply_bam_switch() {
         log "ERROR: setBamUrl returned error: $resp"
         return 1
     fi
-    debug "setBamUrl response: $resp"
+    debug "setBamUrl via socat: $resp"
     return 0
 }
 
@@ -426,38 +440,80 @@ scan_bam() {
         fi
     fi
 
-    # BAM metric anomalies
+    # BAM metric anomalies — only alert if sustained > BAM_METRIC_MIN_DURATION seconds
     local metric_errors
     metric_errors=$(echo "$new_content" | grep -E "$BAM_METRIC_PATTERN" || true)
 
     if [[ -n "$metric_errors" ]]; then
-        local unique_metrics
-        unique_metrics=$(echo "$metric_errors" | dedup_errors "$hash_metric")
+        # Extract first and last timestamps from matching lines in this batch
+        local batch_first_ts batch_last_ts
+        read -r batch_first_ts batch_last_ts < <(echo "$metric_errors" | python3 -c "
+import sys, re
+first = last = ''
+for line in sys.stdin:
+    m = re.match(r'\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})', line)
+    if m:
+        if not first:
+            first = m.group(1)
+        last = m.group(1)
+print(first, last)
+")
 
-        if [[ -n "$unique_metrics" ]]; then
-            local count
-            count=$(echo "$unique_metrics" | wc -l)
-            log "Found $count unique BAM metric anomalie(s)"
-
-            local samples
-            samples=$(echo "$unique_metrics" | head -5 | while IFS= read -r line; do
-                if (( ${#line} > 200 )); then
-                    echo "${line:0:200}..."
-                else
-                    echo "$line"
-                fi
-            done)
-
-            local title="BAM Metric Anomalies ($count new)"
-            local desc
-            desc=$(printf '```\n%s\n```' "$samples")
-            if (( count > 5 )); then
-                desc+=$'\n'"_(showing 5 of $count anomalies)_"
-            fi
-
-            send_discord "$title" "$desc" "warning"
-            sleep 2
+        # Persist the earliest anomaly start across scans so cross-batch spans count
+        local anomaly_start
+        anomaly_start=$(cat "$METRIC_START_FILE" 2>/dev/null || echo "")
+        if [[ -z "$anomaly_start" ]]; then
+            anomaly_start="$batch_first_ts"
+            echo "$anomaly_start" > "$METRIC_START_FILE"
         fi
+
+        local duration
+        duration=$(python3 -c "
+from datetime import datetime
+a = datetime.strptime('$anomaly_start', '%Y-%m-%dT%H:%M:%S')
+b = datetime.strptime('$batch_last_ts', '%Y-%m-%dT%H:%M:%S')
+print(int((b - a).total_seconds()))
+" 2>/dev/null || echo 0)
+
+        debug "BAM metric anomaly duration: ${duration}s (start=$anomaly_start last=$batch_last_ts)"
+
+        if (( duration >= BAM_METRIC_MIN_DURATION )); then
+            local unique_metrics
+            unique_metrics=$(echo "$metric_errors" | dedup_errors "$hash_metric")
+
+            if [[ -n "$unique_metrics" ]]; then
+                local count
+                count=$(echo "$unique_metrics" | wc -l)
+                log "Found $count unique BAM metric anomalie(s), sustained ${duration}s"
+
+                local samples
+                samples=$(echo "$unique_metrics" | head -5 | while IFS= read -r line; do
+                    if (( ${#line} > 200 )); then
+                        echo "${line:0:200}..."
+                    else
+                        echo "$line"
+                    fi
+                done)
+
+                local title="BAM Metric Anomalies ($count new, ${duration}s sustained)"
+                local desc
+                desc=$(printf '```\n%s\n```' "$samples")
+                if (( count > 5 )); then
+                    desc+=$'\n'"_(showing 5 of $count anomalies)_"
+                fi
+
+                send_discord "$title" "$desc" "warning"
+                sleep 2
+            fi
+        else
+            log "Suppressing BAM metric anomaly alert (duration ${duration}s < ${BAM_METRIC_MIN_DURATION}s threshold)"
+            # Don't count toward failover logic for sub-threshold blips
+            metric_errors=""
+        fi
+    else
+        # No anomaly lines in this batch — clear persisted start so the next
+        # occurrence starts a fresh duration window.
+        rm -f "$METRIC_START_FILE"
     fi
 
     # ── Failover logic ──────────────────────────────────────────────────
