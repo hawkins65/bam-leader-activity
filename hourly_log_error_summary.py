@@ -28,6 +28,9 @@ DISCORD_EMBED_SCRIPT = Path.home() / "999_discord_embed.sh"
 BOT_USERNAME = "Validator Log Summary"
 HOSTNAME = subprocess.run(['hostname'], capture_output=True, text=True).stdout.strip()
 SCRIPT_PATH = f"{HOSTNAME}:{os.path.abspath(__file__)}"
+VALIDATOR_IDENTITY = subprocess.run(
+    ['solana', 'address'], capture_output=True, text=True
+).stdout.strip() or "unknown"
 LOG_DIR = Path.home() / "logs"
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
 LARGE_FILE_THRESHOLD = 100 * 1024 * 1024  # 100MB
@@ -105,6 +108,11 @@ TRACKED_LOW_SEVERITY = [
         "name": "Entry Error (Block Replay)",
         "pattern": re.compile(r'datapoint: validator_process_entry_error'),
         "description": "Transaction failed during block replay (invalid txns included by other leaders — normal network noise, all failure reasons)",
+    },
+    {
+        "name": "Vote State Dropped (Other Validators)",
+        "pattern": re.compile(r'vote_state\].*dropped vote.*failed to match hash'),
+        "description": "Other validators' votes dropped during block replay due to hash mismatches (normal consensus behavior, not this validator's votes)",
     },
     {
         "name": "Tower Restore",
@@ -434,8 +442,7 @@ def format_bam_section(bam_data):
     if bam_data['error_categories']:
         for cat, count in sorted(bam_data['error_categories'].items(), key=lambda x: -x[1]):
             lines.append(f"  - {cat}: {count}")
-    lines.append(f"Scheduler datapoints: {bam_data['scheduler_events']}")
-    lines.append(f"Leader slots: {bam_data['leader_slots']}")
+    lines.append(f"BAM metric datapoints: {bam_data['scheduler_events']}")
     for key in BAM_METRIC_KEYS:
         val = bam_data['metrics'].get(key, 0)
         if val > 0:
@@ -446,14 +453,11 @@ def format_bam_section(bam_data):
 def format_bam_embed(bam_data):
     """Format BAM data for Discord embed display."""
     lines = []
-    lines.append(f"**Scheduler events:** {bam_data['scheduler_events']}")
-    lines.append(f"**Leader slots:** {bam_data['leader_slots']}")
-    lines.append("")
     lines.append("**Metrics:**")
     for key in BAM_METRIC_KEYS:
         val = bam_data['metrics'].get(key, 0)
         if val > 0:
-            lines.append(f"• `{key}`: {val}")
+            lines.append(f"• {key}: {val}")
     if not any(bam_data['metrics'].get(k, 0) > 0 for k in BAM_METRIC_KEYS):
         lines.append("• No BAM metric datapoints in this period")
     return "\n".join(lines)
@@ -487,6 +491,7 @@ def call_claude_api(api_key, errors_text, error_count, tracked_counts, bam_data=
 Include a BAM-specific bullet point in your summary assessing BAM health (connection stability, bundle processing, heartbeat status)."""
 
     prompt = f"""You are analyzing error logs from a Solana testnet validator.
+Validator identity: {VALIDATOR_IDENTITY}
 There were {error_count} genuine errors ({len(errors_text.splitlines()) if errors_text.strip() else 0} unique patterns) in the past hour.{tracked_section}{bam_prompt_section}
 
 Provide a concise summary with 4-6 bullet points. Categorize each by severity:
@@ -494,6 +499,8 @@ Provide a concise summary with 4-6 bullet points. Categorize each by severity:
 - 🟠 HIGH: Connectivity issues, repeated failures affecting operation
 - 🟡 MEDIUM: Transient errors, retryable failures
 - 🟢 LOW: Minor warnings, cosmetic issues, expected low-severity errors
+
+For any MEDIUM or higher severity bullet, include the relevant validator pubkey (from the log lines) so it's clear which validator is affected. Our validator identity is {VALIDATOR_IDENTITY} — distinguish between issues affecting our validator vs. other validators on the network.
 
 Start with an overall status line like:
 "✅ Validator healthy — minor issues only" or "⚠️ Attention needed — connectivity problems detected" or "🚨 Critical issues detected"
@@ -542,6 +549,9 @@ def send_discord_embed(severity, title, description, footer_extra="", pagerduty=
 
     # Use \n literals — the bash script converts them to real newlines
     description = description.replace('\n', '\\n')
+    # Escape backticks and $ to prevent bash interpretation inside double quotes
+    description = description.replace('`', '\\`').replace('$', '\\$')
+    title = title.replace('`', '\\`').replace('$', '\\$')
 
     cmd = (
         f'source "{DISCORD_EMBED_SCRIPT}" && '
@@ -703,7 +713,7 @@ def main():
     # Build description
     desc_parts = [summary]
     if all_errors:
-        file_breakdown = "\n".join(f"• `{fname}`: {len(errs)} errors" for fname, errs in all_errors.items())
+        file_breakdown = "\n".join(f"• {fname}: {len(errs)} errors" for fname, errs in all_errors.items())
         desc_parts.append(f"\n**Files:**\n{file_breakdown}")
     if bam_data:
         if bam_data['connection_errors'] == 0 and bam_data['unhealthy'] == 0:
