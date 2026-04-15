@@ -2,6 +2,8 @@
 
 Analyzes Solana validator logs to correlate BAM (Block Assembly Marketplace) bundle activity with leader slots.
 
+> **Deploying on a new host?** See [SETUP.md](SETUP.md) for a clone-and-configure walkthrough covering systemd, cron, Discord, and config files.
+
 ## Usage
 
 ```bash

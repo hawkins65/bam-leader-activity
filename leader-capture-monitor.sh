@@ -40,6 +40,11 @@ source "$VALIDATOR_CONFIG"
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 OUTPUT_DIR="$SCRIPT_DIR/captures"
+DAILY_LEDGER="$SCRIPT_DIR/daily_totals.jsonl"
+# Day boundary: 18:15 America/Chicago. A capture's "central_day" is the
+# label of the day-window it falls into (window runs 18:15 → next 18:14).
+DAY_ROLLOVER_HHMM="1815"
+DAY_TZ="America/Chicago"
 
 # Detect mainnet vs testnet from ~/validator.sh (or $NETWORK override).
 # Exported so child processes (slot-transactions.py) skip re-parsing.
@@ -132,6 +137,41 @@ send_discord() {
         username="$BOT_USERNAME" \
         script_path="$SCRIPT_PATH" \
         pagerduty=false
+}
+
+# Return the central_day label (YYYY-MM-DD) for a given epoch timestamp.
+# A day starts at DAY_ROLLOVER_HHMM in DAY_TZ. If local time is before the
+# rollover, the label is the previous calendar date.
+central_day_label() {
+    local ts="$1"
+    TZ="$DAY_TZ" date -d "@$ts" +"%Y-%m-%d %H%M" | awk -v r="$DAY_ROLLOVER_HHMM" '
+        { if ($2 >= r) print $1;
+          else { cmd = "TZ=\"'"$DAY_TZ"'\" date -d \"" $1 " -1 day\" +%Y-%m-%d"; cmd | getline y; close(cmd); print y } }'
+}
+
+# Append a capture to the JSONL ledger and echo today's running totals
+# (fees_sol tips_sol revenue_sol rotation_count) to stdout.
+update_daily_ledger() {
+    local ts="$1" fees="$2" tips="$3" revenue="$4" slots="$5" first="$6" last="$7"
+    local day
+    day=$(central_day_label "$ts")
+    printf '{"ts":%d,"central_day":"%s","first_slot":%d,"last_slot":%d,"slots":%d,"fees_sol":%s,"tips_sol":%s,"revenue_sol":%s}\n' \
+        "$ts" "$day" "$first" "$last" "$slots" "$fees" "$tips" "$revenue" >> "$DAILY_LEDGER"
+    python3 - "$DAILY_LEDGER" "$day" <<'PY'
+import json, sys
+path, day = sys.argv[1], sys.argv[2]
+f = t = r = 0.0; n = 0
+with open(path) as fh:
+    for line in fh:
+        try: d = json.loads(line)
+        except Exception: continue
+        if d.get("central_day") != day: continue
+        f += float(d.get("fees_sol", 0))
+        t += float(d.get("tips_sol", 0))
+        r += float(d.get("revenue_sol", 0))
+        n += 1
+print(f"{f:.6f} {t:.6f} {r:.6f} {n}")
+PY
 }
 
 duration_fmt() {
@@ -307,6 +347,17 @@ print(
     desc+=$'\n'"**Fees earned:** ${total_fees_sol} SOL"
     desc+=$'\n'"**Jito tips earned:** ${total_tips_sol} SOL (tip-PDA inflow during our slots)"
     desc+=$'\n'"**Total revenue:** ${total_revenue_sol} SOL"
+
+    # Update daily ledger and append rolling subtotal (since 18:15 CT)
+    local day_line day_fees day_tips day_rev day_n
+    day_line=$(update_daily_ledger "$capture_end_time" \
+        "$total_fees_sol" "$total_tips_sol" "$total_revenue_sol" \
+        "$total_slots" "$first_slot" "$last_slot")
+    read -r day_fees day_tips day_rev day_n <<< "$day_line"
+    local day_label
+    day_label=$(central_day_label "$capture_end_time")
+    desc+=$'\n'"**Today (${day_label}, since 18:15 CT):** ${day_fees} fees + ${day_tips} tips = ${day_rev} SOL across ${day_n} rotation(s)"
+
     if (( withdrawal_count > 0 )); then
         desc+=$'\n'"⚠️ **Tip account withdrawals:** ${withdrawal_count} event(s), ${withdrawal_sol} SOL out — see ${text_file}"
     fi
