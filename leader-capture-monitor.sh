@@ -305,7 +305,7 @@ print(
     desc+=$'\n'"**Capture window:** $(duration_fmt $capture_duration)"
     desc+=$'\n'"**Transactions:** ${total_txns} (${success_count} success, ${failed_count} failed)"
     desc+=$'\n'"**Fees earned:** ${total_fees_sol} SOL"
-    desc+=$'\n'"**Jito tips:** ${total_tips_sol} SOL"
+    desc+=$'\n'"**Jito tips earned:** ${total_tips_sol} SOL (tip-PDA inflow during our slots)"
     desc+=$'\n'"**Total revenue:** ${total_revenue_sol} SOL"
     if (( withdrawal_count > 0 )); then
         desc+=$'\n'"⚠️ **Tip account withdrawals:** ${withdrawal_count} event(s), ${withdrawal_sol} SOL out — see ${text_file}"

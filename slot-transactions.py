@@ -205,10 +205,14 @@ def extract_slot_data(rpc_url, slot, jito_cfg, validator_identity):
     """Extract transaction data from a single slot.
 
     Tip accounting:
-      - tips_in_lamports: sum of positive deltas into tip PDAs (gross inflow)
+      - tips_in_lamports: sum of positive deltas into tip PDAs during our
+        leader slots. This IS our tip revenue — tips deposited while we're
+        leader belong to us (they'll be swept into our TipDistributionAccount
+        by change_tip_receiver, typically at the next leader rotation).
       - self_drain_lamports: sum of outflows FROM tip PDAs in txns signed by
-        OUR validator_identity (i.e. us calling change_tip_receiver to sweep
-        tips into our own TipDistributionAccount — this is our tip revenue)
+        OUR validator_identity (actual sweeps executed during this window —
+        these come from prior leader slots, not necessarily these ones, so
+        this is informational only, not our revenue for this rotation).
       - tip_anomalies: withdrawals from tip PDAs signed by something that is
         NOT a validator identity (neither ours nor any other). Other
         validators' own sweeps landing in our block are silently ignored.
@@ -229,8 +233,10 @@ def extract_slot_data(rpc_url, slot, jito_cfg, validator_identity):
     tip_accounts = jito_cfg["tip_accounts"]
     tip_payment_program = jito_cfg["tip_payment_program"]
 
-    # Authoritative leader fee credit for this block (post-burn, priority + base share).
-    # Taken from block.rewards[] where rewardType == "Fee".
+    # Authoritative leader fee credit for this block from block.rewards[]
+    # where rewardType == "Fee". Per SIMD-0096, priority fees are no longer
+    # burned (100% to leader); base fees still have the 50% burn. The reward
+    # entry already reflects the final post-burn leader credit.
     leader_fee_lamports = 0
     for r in block.get("rewards") or []:
         if r.get("rewardType") == "Fee":
@@ -365,8 +371,12 @@ def output_text(slots_data, explorer_url, validator_identity, network):
             total_compute += tx["compute_units"]
 
     active_slots = len(slots_data) - skipped_slots - error_slots
-    # Authoritative tip revenue: sum of outflows in txns we signed.
-    tip_revenue = total_self_drain
+    # Authoritative tip revenue: gross inflow into tip PDAs during our leader
+    # slots. These tips belong to us — change_tip_receiver will sweep them
+    # into our TipDistributionAccount at the next sweep point. The self-drain
+    # measured in THIS window reflects sweeps of PRIOR rotations' tips, so
+    # it's informational, not the revenue earned from the current slots.
+    tip_revenue = total_tips_in
     total_revenue = leader_fees_earned + tip_revenue
 
     print(f"\n{'LEADER SLOT TRANSACTION REPORT':=^100}")
@@ -381,10 +391,10 @@ def output_text(slots_data, explorer_url, validator_identity, network):
     print(f"  Successful: {total_success:,}")
     print(f"  Failed: {total_failed:,}")
     print(f"  Fees earned (leader credit): {format_sol(leader_fees_earned)} SOL ({leader_fees_earned:,} lamports)")
-    print(f"  Jito tip revenue (self-drain): {format_sol(tip_revenue)} SOL ({tip_revenue:,} lamports)")
+    print(f"  Jito tips earned (tip-PDA inflow): {format_sol(tip_revenue)} SOL ({tip_revenue:,} lamports)")
     print(f"  Total leader revenue:        {format_sol(total_revenue)} SOL")
-    print(f"  Tip inflow (informational): {format_sol(total_tips_in)} SOL "
-          "(gross deposits into tip PDAs; our revenue is the self-drain above)")
+    print(f"  Sweeps executed in window (informational): {format_sol(total_self_drain)} SOL "
+          "(outflows from tip PDAs in txns we signed; reflects prior rotations' tips, not this one)")
     print(f"  Gross fees paid (non-vote):  {format_sol(gross_fees_paid)} SOL ({gross_fees_paid:,} lamports)")
     if anomaly_events:
         total_anomaly = sum(-a["lamports"] for _, a in anomaly_events)
@@ -416,7 +426,7 @@ def output_text(slots_data, explorer_url, validator_identity, network):
         n_success = sum(1 for t in txns if t["success"])
         n_failed = sum(1 for t in txns if not t["success"])
         earned = sd.get("leader_fee_lamports", 0)
-        tip_rev = sd.get("self_drain_lamports", 0)
+        tip_rev = sd.get("tips_in_lamports", 0)
         compute = sum(t["compute_units"] for t in txns)
         print(f"{slot:<14} | {'OK':<7} | {len(txns):>6} | {n_success:>6} | {n_failed:>5} | {format_sol(earned):>12} | {format_sol(tip_rev):>14} | {compute:>12,}")
 
@@ -479,7 +489,10 @@ def output_json(slots_data, explorer_url, validator_identity, network):
                 total_failed += 1
 
     anomaly_lamports = sum(-a["lamports"] for a in anomalies_flat)
-    tip_revenue = total_self_drain
+    # Tip revenue = inflow into tip PDAs during our leader slots (these tips
+    # belong to us, will be swept to our TipDistributionAccount). self-drain
+    # in THIS window comes from prior rotations' tips and is informational.
+    tip_revenue = total_tips_in
     total_revenue = leader_fees_earned + tip_revenue
 
     output = {
@@ -493,21 +506,26 @@ def output_json(slots_data, explorer_url, validator_identity, network):
             "total_non_vote_transactions": total_txns,
             "successful": total_success,
             "failed": total_failed,
-            # Authoritative leader credit from block.rewards[] (post-burn).
+            # Authoritative leader credit from block.rewards[]. Post-SIMD-0096
+            # the leader receives 100% of priority fees + 50% of base fees.
             "total_fees_lamports": leader_fees_earned,
             "total_fees_sol": leader_fees_earned / 1e9,
-            # Authoritative tip revenue: outflows from tip PDAs in txns
-            # signed by our validator identity (change_tip_receiver sweeps).
-            # Back-compat: keep the `total_tips_*` field names so downstream
-            # readers (hourly summary, leader-capture-monitor.sh) don't break.
+            # Authoritative tip revenue: gross inflow into tip PDAs during
+            # our leader slots. These tips are ours — they'll be swept to
+            # our TipDistributionAccount by change_tip_receiver at the next
+            # sweep point. (Back-compat field name: total_tips_*.)
             "total_tips_lamports": tip_revenue,
             "total_tips_sol": tip_revenue / 1e9,
             "total_revenue_lamports": total_revenue,
             "total_revenue_sol": total_revenue / 1e9,
-            # Informational: gross deposits INTO tip PDAs (not our revenue —
-            # see self_drain above for that — but useful for context).
+            # Same value, explicit name.
             "tip_inflow_lamports": total_tips_in,
             "tip_inflow_sol": total_tips_in / 1e9,
+            # Informational: sweeps executed in this window (change_tip_receiver
+            # outflows signed by us). Reflects PRIOR rotations' tips, not
+            # the current one — don't add to revenue.
+            "sweeps_executed_lamports": total_self_drain,
+            "sweeps_executed_sol": total_self_drain / 1e9,
             # Suspicious withdrawals we couldn't attribute. Should be 0.
             "tip_anomaly_count": len(anomalies_flat),
             "tip_anomaly_lamports": anomaly_lamports,
