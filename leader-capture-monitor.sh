@@ -63,6 +63,10 @@ case "$NETWORK" in
 esac
 VALIDATOR_IDENTITY="${VALIDATOR_IDENTITY:?VALIDATOR_IDENTITY not set in $VALIDATOR_CONFIG}"
 
+# Read commission from validator.sh (--commission-bps value, in basis points)
+COMMISSION_BPS=$(grep -oP '(?<=--commission-bps )\d+' "$HOME/validator.sh" 2>/dev/null || echo "0")
+COMMISSION_PCT=$(echo "scale=4; $COMMISSION_BPS / 100" | bc -l)
+
 # Timing configuration
 BUFFER_AFTER_SECONDS=60     # Wait this long after last slot before querying RPC
 MERGE_GAP_SECONDS=180       # Merge groups closer than this (3 minutes)
@@ -157,9 +161,10 @@ update_daily_ledger() {
     day=$(central_day_label "$ts")
     printf '{"ts":%d,"central_day":"%s","first_slot":%d,"last_slot":%d,"slots":%d,"fees_sol":%s,"tips_sol":%s,"revenue_sol":%s}\n' \
         "$ts" "$day" "$first" "$last" "$slots" "$fees" "$tips" "$revenue" >> "$DAILY_LEDGER"
-    python3 - "$DAILY_LEDGER" "$day" <<'PY'
+    python3 - "$DAILY_LEDGER" "$day" "$COMMISSION_PCT" <<'PY'
 import json, sys
 path, day = sys.argv[1], sys.argv[2]
+comm_pct = float(sys.argv[3])
 f = t = r = 0.0; n = 0
 with open(path) as fh:
     for line in fh:
@@ -170,7 +175,9 @@ with open(path) as fh:
         t += float(d.get("tips_sol", 0))
         r += float(d.get("revenue_sol", 0))
         n += 1
-print(f"{f:.6f} {t:.6f} {r:.6f} {n}")
+tips_to_val = t * comm_pct / 100
+total_to_val = f + tips_to_val
+print(f"{f:.6f} {t:.6f} {r:.6f} {n} {tips_to_val:.6f} {total_to_val:.6f}")
 PY
 }
 
@@ -328,6 +335,11 @@ print(
         group_label="${num_groups} rotations"
     fi
 
+    # Compute validator's share: commission % of Jito tips
+    local jito_to_validator total_to_validator
+    jito_to_validator=$(printf '%.6f' "$(echo "$total_tips_sol * $COMMISSION_PCT / 100" | bc -l)")
+    total_to_validator=$(printf '%.6f' "$(echo "$total_fees_sol + $jito_to_validator" | bc -l)")
+
     # Build Discord message
     local severity="info"
     if (( total_txns == 0 )); then
@@ -346,17 +358,18 @@ print(
     desc+=$'\n'"**Transactions:** ${total_txns} (${success_count} success, ${failed_count} failed)"
     desc+=$'\n'"**Fees earned:** ${total_fees_sol} SOL"
     desc+=$'\n'"**Jito tips earned:** ${total_tips_sol} SOL (tip-PDA inflow during our slots)"
-    desc+=$'\n'"**Total revenue:** ${total_revenue_sol} SOL"
+    desc+=$'\n'"**Jito to Validator:** ${jito_to_validator} SOL (${COMMISSION_PCT}% commission)"
+    desc+=$'\n'"**Total to Validator:** ${total_to_validator} SOL"
 
     # Update daily ledger and append rolling subtotal (since 18:15 CT)
-    local day_line day_fees day_tips day_rev day_n
+    local day_line day_fees day_tips day_rev day_n day_tips_to_val day_total_to_val
     day_line=$(update_daily_ledger "$capture_end_time" \
         "$total_fees_sol" "$total_tips_sol" "$total_revenue_sol" \
         "$total_slots" "$first_slot" "$last_slot")
-    read -r day_fees day_tips day_rev day_n <<< "$day_line"
+    read -r day_fees day_tips day_rev day_n day_tips_to_val day_total_to_val <<< "$day_line"
     local day_label
     day_label=$(central_day_label "$capture_end_time")
-    desc+=$'\n'"**Today (${day_label}, since 18:15 CT):** ${day_fees} fees + ${day_tips} tips = ${day_rev} SOL across ${day_n} rotation(s)"
+    desc+=$'\n'"**Today (${day_label}, since 18:15 CT):** ${day_fees} fees + ${day_tips_to_val} tips (${COMMISSION_PCT}%) = ${day_total_to_val} SOL to validator across ${day_n} rotation(s)"
 
     if (( withdrawal_count > 0 )); then
         desc+=$'\n'"⚠️ **Tip account withdrawals:** ${withdrawal_count} event(s), ${withdrawal_sol} SOL out — see ${text_file}"
@@ -380,7 +393,8 @@ print(
     log "  Transactions: $total_txns ($success_count success, $failed_count failed)"
     log "  Fees: $total_fees_sol SOL"
     log "  Tips: $total_tips_sol SOL"
-    log "  Revenue: $total_revenue_sol SOL"
+    log "  Jito to Validator: $jito_to_validator SOL (${COMMISSION_PCT}%)"
+    log "  Total to Validator: $total_to_validator SOL"
     if (( withdrawal_count > 0 )); then
         log "  ⚠️  Tip withdrawals: $withdrawal_count event(s), $withdrawal_sol SOL out"
     fi

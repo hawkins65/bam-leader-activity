@@ -20,6 +20,10 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 LEDGER="$SCRIPT_DIR/daily_totals.jsonl"
 DAY_TZ="America/Chicago"
 
+# Read commission from validator.sh (--commission-bps value, in basis points)
+COMMISSION_BPS=$(grep -oP '(?<=--commission-bps )\d+' "$HOME/validator.sh" 2>/dev/null || echo "0")
+COMMISSION_PCT=$(echo "scale=4; $COMMISSION_BPS / 100" | bc -l)
+
 DISCORD_WEBHOOK="$(cat "$HOME/.config/discord/webhook" 2>/dev/null | tr -d '[:space:]')"
 DISCORD_EMBED_SCRIPT="$HOME/999_discord_embed.sh"
 BOT_USERNAME="Leader Daily Summary"
@@ -54,7 +58,7 @@ if [[ ! -s "$LEDGER" ]]; then
     exit 0
 fi
 
-summary=$(python3 - "$LEDGER" "$DAY" <<'PY'
+summary=$(python3 - "$LEDGER" "$DAY" "$COMMISSION_PCT" <<'PY'
 import json, sys
 path, day = sys.argv[1], sys.argv[2]
 fees = tips = rev = 0.0
@@ -75,11 +79,14 @@ with open(path) as fh:
         ts = int(d.get("ts", 0))
         first_ts = ts if first_ts is None else min(first_ts, ts)
         last_ts  = ts if last_ts  is None else max(last_ts, ts)
-print(f"{rotations} {slots} {fees:.6f} {tips:.6f} {rev:.6f} {first_ts or 0} {last_ts or 0}")
+comm_pct = float(sys.argv[3])
+tips_to_val = tips * comm_pct / 100
+total_to_val = fees + tips_to_val
+print(f"{rotations} {slots} {fees:.6f} {tips:.6f} {rev:.6f} {first_ts or 0} {last_ts or 0} {tips_to_val:.6f} {total_to_val:.6f}")
 PY
 )
 
-read -r rotations slots fees tips rev first_ts last_ts <<< "$summary"
+read -r rotations slots fees tips rev first_ts last_ts tips_to_val total_to_val <<< "$summary"
 
 if (( rotations == 0 )); then
     log "No captures for central_day=$DAY; skipping Discord post"
@@ -93,11 +100,12 @@ desc="**Window:** ${window_start} → ${window_end}"
 desc+=$'\n'"**Rotations:** ${rotations} (${slots} leader slots)"
 desc+=$'\n'"**Fees earned:** ${fees} SOL"
 desc+=$'\n'"**Jito tips earned:** ${tips} SOL"
-desc+=$'\n'"**Total revenue:** ${rev} SOL"
+desc+=$'\n'"**Jito to Validator:** ${tips_to_val} SOL (${COMMISSION_PCT}% commission)"
+desc+=$'\n'"**Total to Validator:** ${total_to_val} SOL"
 
 title="Daily Leader Revenue — ${DAY}"
 
-log "Summary for $DAY: rotations=$rotations slots=$slots fees=$fees tips=$tips revenue=$rev"
+log "Summary for $DAY: rotations=$rotations slots=$slots fees=$fees tips=$tips tips_to_val=$tips_to_val total_to_val=$total_to_val"
 
 if $DRY_RUN; then
     log "[DRY-RUN] Would post to Discord:"
