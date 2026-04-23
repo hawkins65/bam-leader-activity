@@ -218,7 +218,9 @@ get_current_slot() {
 
 # Get upcoming leader slot groups as merged capture windows.
 # Uses getLeaderSchedule + getEpochInfo via RPC, processes with jq.
-# Output: one line per window: "first_slot last_slot num_groups"
+# Output: one line per window: "first_slot last_slot num_rotations leader_slots_csv"
+# where leader_slots_csv lists the actual leader slots in the window (not the
+# inter-rotation gap slots that belong to other validators).
 get_capture_windows() {
     local current_slot="$1"
     local slot_duration="$2"
@@ -244,22 +246,25 @@ get_capture_windows() {
         | map(select(. > $cs))
         | sort
         | if length == 0 then empty else
-            # Group consecutive slots
+            # Phase 1: group consecutive leader slots into runs [first, last]
             reduce .[] as $s ([];
-                if length == 0 then [[($s), ($s)]]
-                elif (.[length-1][1] + 1) == $s then .[length-1][1] = $s
-                else . + [[($s), ($s)]]
+                if length == 0 then [[$s, $s]]
+                elif (.[-1][1] + 1) == $s then (.[0:-1] + [[.[-1][0], $s]])
+                else . + [[$s, $s]]
                 end
             )
-            # Merge groups closer than merge_gap seconds
-            | reduce .[] as $g ([];
-                if length == 0 then [$g]
-                elif (($g[0] - .[length-1][1]) * $sd) < $mg then .[length-1] = [.[length-1][0], $g[1]]
-                else . + [$g]
+            # Phase 2: merge runs closer than mg seconds into windows; each
+            # window keeps its member runs so we can emit ONLY the actual
+            # leader slots (not the other-validator slots in the merge gap).
+            | reduce .[] as $r ([];
+                if length == 0 then [[$r]]
+                elif (($r[0] - .[-1][-1][1]) * $sd) < $mg then
+                    (.[0:-1] + [.[-1] + [$r]])
+                else . + [[$r]]
                 end
             )
             | .[]
-            | "\(.[0]) \(.[1]) 1"
+            | "\(.[0][0]) \(.[-1][1]) \(length) \([.[] | range(.[0]; .[1] + 1)] | join(","))"
           end
     ' 2>/dev/null
 }
@@ -273,6 +278,7 @@ extract_and_report() {
     local first_slot="$3"
     local last_slot="$4"
     local num_groups="$5"
+    local leader_slots_csv="$6"
 
     local timestamp
     timestamp=$(date -u +"%Y%m%d_%H%M%S")
@@ -282,13 +288,15 @@ extract_and_report() {
     log "Querying RPC for leader slot transactions..."
 
     if $DRY_RUN; then
-        log "[DRY-RUN] Would query slots $first_slot–$last_slot and report to Discord"
+        log "[DRY-RUN] Would query leader slots $leader_slots_csv and report to Discord"
         return 0
     fi
 
-    # Query RPC for block data from our leader slots (stderr has progress, keep it separate)
-    "$SLOT_TRANSACTIONS_SCRIPT" --slots "$first_slot" "$last_slot" > "$text_file" 2>/dev/null
-    "$SLOT_TRANSACTIONS_SCRIPT" --slots "$first_slot" "$last_slot" --json > "$json_file" 2>/dev/null
+    # Query RPC ONLY for our actual leader slots (not the inter-rotation gap
+    # slots owned by other validators). slot-transactions.py also filters
+    # block.rewards[] by our pubkey as a defensive second layer.
+    "$SLOT_TRANSACTIONS_SCRIPT" --leader-slots "$leader_slots_csv" > "$text_file" 2>/dev/null
+    "$SLOT_TRANSACTIONS_SCRIPT" --leader-slots "$leader_slots_csv" --json > "$json_file" 2>/dev/null
 
     # Parse summary from JSON output (one python invocation, not five)
     local summary_line
@@ -327,7 +335,14 @@ print(
 
     local capture_duration=$(( capture_end_time - capture_start_time ))
     local slot_range="${first_slot}–${last_slot}"
-    local total_slots=$(( last_slot - first_slot + 1 ))
+    # Count of OUR leader slots in the window (not the range span, which
+    # would include other validators' slots between merged rotations).
+    local total_slots
+    if [[ -n "$leader_slots_csv" ]]; then
+        total_slots=$(awk -F, '{print NF}' <<< "$leader_slots_csv")
+    else
+        total_slots=$(( last_slot - first_slot + 1 ))
+    fi
     local produced_slots=$(( total_slots - skipped_slots ))
 
     local group_label="rotation"
@@ -426,9 +441,9 @@ run_capture_cycle() {
         return 1
     fi
 
-    local first_slot last_slot num_groups
-    read -r first_slot last_slot num_groups <<< "$(echo "$windows" | head -1)"
-    debug "Next capture window: slots $first_slot-$last_slot ($num_groups group(s) merged)"
+    local first_slot last_slot num_groups leader_slots_csv
+    read -r first_slot last_slot num_groups leader_slots_csv <<< "$(echo "$windows" | head -1)"
+    debug "Next capture window: slots $first_slot-$last_slot ($num_groups rotation(s), leader slots: $leader_slots_csv)"
 
     # Calculate time until the leader window
     local slots_until_start=$(( first_slot - current_slot ))
@@ -536,7 +551,7 @@ run_capture_cycle() {
     # ── Extract and report ────────────────────────────────────────────────
 
     extract_and_report "$capture_start_time" "$capture_end_time" \
-        "$first_slot" "$last_slot" "$num_groups"
+        "$first_slot" "$last_slot" "$num_groups" "$leader_slots_csv"
 }
 
 # ── Entry point ───────────────────────────────────────────────────────────────

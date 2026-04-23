@@ -10,6 +10,7 @@ Usage:
   ./slot-transactions.py --slots 412321072 412321075
   ./slot-transactions.py --slots 412321072 412321075 --json
   ./slot-transactions.py --slots 412321072 412321075 --summary
+  ./slot-transactions.py --leader-slots 412321072,412321073,412321074,412321075
 """
 
 import json
@@ -234,13 +235,20 @@ def extract_slot_data(rpc_url, slot, jito_cfg, validator_identity):
     tip_payment_program = jito_cfg["tip_payment_program"]
 
     # Authoritative leader fee credit for this block from block.rewards[]
-    # where rewardType == "Fee". Per SIMD-0096, priority fees are no longer
-    # burned (100% to leader); base fees still have the 50% burn. The reward
-    # entry already reflects the final post-burn leader credit.
+    # where rewardType == "Fee" AND pubkey matches our validator identity.
+    # The pubkey filter is critical: when called on a merged-window slot
+    # range (see leader-capture-monitor.sh), some blocks are produced by
+    # OTHER validators and their Fee rewards would otherwise be counted
+    # as ours. Per SIMD-0096, priority fees are no longer burned (100% to
+    # leader); base fees still have the 50% burn — the reward entry
+    # already reflects the final post-burn leader credit.
     leader_fee_lamports = 0
     for r in block.get("rewards") or []:
-        if r.get("rewardType") == "Fee":
-            leader_fee_lamports += r.get("lamports", 0)
+        if r.get("rewardType") != "Fee":
+            continue
+        if validator_identity and r.get("pubkey") != validator_identity:
+            continue
+        leader_fee_lamports += r.get("lamports", 0)
 
     tips_in_lamports = 0
     self_drain_lamports = 0
@@ -555,6 +563,7 @@ def main():
     # Parse arguments
     first_slot = None
     last_slot = None
+    leader_slots_arg = None
     output_format = "text"
     summary_only = False
     explorer_url = DEFAULT_EXPLORER_URL
@@ -566,6 +575,9 @@ def main():
             first_slot = int(args[i + 1])
             last_slot = int(args[i + 2])
             i += 3
+        elif args[i] == "--leader-slots" and i + 1 < len(args):
+            leader_slots_arg = args[i + 1]
+            i += 2
         elif args[i] == "--json":
             output_format = "json"
             i += 1
@@ -582,8 +594,9 @@ def main():
             print(f"Unknown argument: {args[i]}", file=sys.stderr)
             sys.exit(1)
 
-    if first_slot is None or last_slot is None:
-        print("Error: --slots FIRST LAST is required", file=sys.stderr)
+    if leader_slots_arg is None and (first_slot is None or last_slot is None):
+        print("Error: --slots FIRST LAST or --leader-slots LIST is required",
+              file=sys.stderr)
         sys.exit(1)
 
     try:
@@ -596,7 +609,14 @@ def main():
     rpc_url = rpc_url_override or load_rpc_url(network)
     validator_identity = load_validator_identity()
 
-    slots = list(range(first_slot, last_slot + 1))
+    if leader_slots_arg is not None:
+        slots = sorted(int(s) for s in leader_slots_arg.split(",") if s.strip())
+        if not slots:
+            print("Error: --leader-slots produced an empty slot list", file=sys.stderr)
+            sys.exit(1)
+        first_slot, last_slot = slots[0], slots[-1]
+    else:
+        slots = list(range(first_slot, last_slot + 1))
     print(f"Querying {len(slots)} slots ({first_slot}–{last_slot}) on {network}...", file=sys.stderr)
 
     slots_data = []
