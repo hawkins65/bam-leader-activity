@@ -385,7 +385,7 @@ print(
         avg_cu_per_block=$(( total_compute_units / produced_slots ))
     fi
     local avg_cu_fmt
-    avg_cu_fmt=$(printf "%'d" "$avg_cu_per_block" 2>/dev/null || echo "$avg_cu_per_block")
+    avg_cu_fmt=$(LC_NUMERIC=en_US.UTF-8 printf "%'d" "$avg_cu_per_block" 2>/dev/null || echo "$avg_cu_per_block")
     desc+=$'\n'"**Avg CU/block:** ${avg_cu_fmt} CU (over ${produced_slots} produced)"
     desc+=$'\n'"**Fees earned:** ${total_fees_sol} SOL"
     desc+=$'\n'"**Jito tips earned:** ${total_tips_sol} SOL (tip-PDA inflow during our slots)"
@@ -406,7 +406,7 @@ print(
     desc+=$'\n'"**Today (${day_label}, since 18:15 CT):** ${day_fees} fees + ${day_tips_to_val} tips (${COMMISSION_PCT}%) = ${day_total_to_val} SOL to validator across ${day_n} rotation(s)"
     if (( day_produced > 0 )); then
         local day_avg_cu_fmt
-        day_avg_cu_fmt=$(printf "%'d" "$day_avg_cu" 2>/dev/null || echo "$day_avg_cu")
+        day_avg_cu_fmt=$(LC_NUMERIC=en_US.UTF-8 printf "%'d" "$day_avg_cu" 2>/dev/null || echo "$day_avg_cu")
         desc+=$'\n'"**Today avg CU/block:** ${day_avg_cu_fmt} CU (over ${day_produced} produced blocks)"
     fi
 
