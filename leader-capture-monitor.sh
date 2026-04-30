@@ -313,15 +313,16 @@ print(
     f\"{d.get('total_revenue_sol', 0):.6f}\",
     d.get('tip_withdrawal_count', 0),
     f\"{d.get('tip_withdrawal_sol', 0):.6f}\",
+    d.get('total_compute_units', 0),
 )
 " 2>/dev/null)
 
     local total_txns success_count failed_count skipped_slots
     local total_fees_sol total_tips_sol total_revenue_sol
-    local withdrawal_count withdrawal_sol
+    local withdrawal_count withdrawal_sol total_compute_units
     read -r total_txns success_count failed_count skipped_slots \
             total_fees_sol total_tips_sol total_revenue_sol \
-            withdrawal_count withdrawal_sol <<< "$summary_line"
+            withdrawal_count withdrawal_sol total_compute_units <<< "$summary_line"
 
     total_txns="${total_txns:-0}"
     success_count="${success_count:-0}"
@@ -332,6 +333,7 @@ print(
     total_revenue_sol="${total_revenue_sol:-0}"
     withdrawal_count="${withdrawal_count:-0}"
     withdrawal_sol="${withdrawal_sol:-0}"
+    total_compute_units="${total_compute_units:-0}"
 
     local capture_duration=$(( capture_end_time - capture_start_time ))
     local slot_range="${first_slot}–${last_slot}"
@@ -371,6 +373,9 @@ print(
     fi
     desc+=$'\n'"**Capture window:** $(duration_fmt $capture_duration)"
     desc+=$'\n'"**Transactions:** ${total_txns} (${success_count} success, ${failed_count} failed)"
+    local total_cu_fmt
+    total_cu_fmt=$(printf "%'d" "$total_compute_units" 2>/dev/null || echo "$total_compute_units")
+    desc+=$'\n'"**Total compute units:** ${total_cu_fmt} CU"
     desc+=$'\n'"**Fees earned:** ${total_fees_sol} SOL"
     desc+=$'\n'"**Jito tips earned:** ${total_tips_sol} SOL (tip-PDA inflow during our slots)"
     desc+=$'\n'"**Jito to Validator:** ${jito_to_validator} SOL (${COMMISSION_PCT}% commission)"
@@ -406,6 +411,7 @@ print(
     log "  Slots: $slot_range ($produced_slots produced, $skipped_slots skipped)"
     log "  Duration: $(duration_fmt $capture_duration)"
     log "  Transactions: $total_txns ($success_count success, $failed_count failed)"
+    log "  Total compute units: ${total_cu_fmt} CU"
     log "  Fees: $total_fees_sol SOL"
     log "  Tips: $total_tips_sol SOL"
     log "  Jito to Validator: $jito_to_validator SOL (${COMMISSION_PCT}%)"

@@ -474,6 +474,7 @@ def output_json(slots_data, explorer_url, validator_identity, network):
     leader_fees_earned = 0
     total_tips_in = 0
     total_self_drain = 0
+    total_compute = 0
     skipped_slots = 0
     anomalies_flat = []
 
@@ -491,6 +492,7 @@ def output_json(slots_data, explorer_url, validator_identity, network):
         for tx in sd["transactions"]:
             total_txns += 1
             gross_fees_paid += tx["fee"]
+            total_compute += tx["compute_units"]
             if tx["success"]:
                 total_success += 1
             else:
@@ -545,6 +547,8 @@ def output_json(slots_data, explorer_url, validator_identity, network):
             # Gross fees paid by users (pre-burn, non-vote only) for comparison.
             "gross_fees_paid_lamports": gross_fees_paid,
             "gross_fees_paid_sol": gross_fees_paid / 1e9,
+            # Total compute units consumed across non-vote transactions.
+            "total_compute_units": total_compute,
         },
         "tip_anomalies": anomalies_flat,
         "explorer_url": explorer_url,

@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 *.pyo
 captures/
+daily_totals.jsonl
+daily_totals.jsonl.*
