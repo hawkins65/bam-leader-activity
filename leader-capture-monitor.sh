@@ -157,15 +157,17 @@ central_day_label() {
 # (fees_sol tips_sol revenue_sol rotation_count) to stdout.
 update_daily_ledger() {
     local ts="$1" fees="$2" tips="$3" revenue="$4" slots="$5" first="$6" last="$7"
+    local cu="$8" produced="$9"
     local day
     day=$(central_day_label "$ts")
-    printf '{"ts":%d,"central_day":"%s","first_slot":%d,"last_slot":%d,"slots":%d,"fees_sol":%s,"tips_sol":%s,"revenue_sol":%s}\n' \
-        "$ts" "$day" "$first" "$last" "$slots" "$fees" "$tips" "$revenue" >> "$DAILY_LEDGER"
+    printf '{"ts":%d,"central_day":"%s","first_slot":%d,"last_slot":%d,"slots":%d,"produced_slots":%d,"fees_sol":%s,"tips_sol":%s,"revenue_sol":%s,"compute_units":%d}\n' \
+        "$ts" "$day" "$first" "$last" "$slots" "$produced" "$fees" "$tips" "$revenue" "$cu" >> "$DAILY_LEDGER"
     python3 - "$DAILY_LEDGER" "$day" "$COMMISSION_PCT" <<'PY'
 import json, sys
 path, day = sys.argv[1], sys.argv[2]
 comm_pct = float(sys.argv[3])
 f = t = r = 0.0; n = 0
+cu_sum = 0; produced_sum = 0
 with open(path) as fh:
     for line in fh:
         try: d = json.loads(line)
@@ -175,9 +177,14 @@ with open(path) as fh:
         t += float(d.get("tips_sol", 0))
         r += float(d.get("revenue_sol", 0))
         n += 1
+        # CU/produced_slots only count for entries that recorded them.
+        if "compute_units" in d and "produced_slots" in d:
+            cu_sum += int(d.get("compute_units", 0) or 0)
+            produced_sum += int(d.get("produced_slots", 0) or 0)
 tips_to_val = t * comm_pct / 100
 total_to_val = f + tips_to_val
-print(f"{f:.6f} {t:.6f} {r:.6f} {n} {tips_to_val:.6f} {total_to_val:.6f}")
+avg_cu = (cu_sum // produced_sum) if produced_sum > 0 else 0
+print(f"{f:.6f} {t:.6f} {r:.6f} {n} {tips_to_val:.6f} {total_to_val:.6f} {avg_cu} {produced_sum}")
 PY
 }
 
@@ -373,9 +380,13 @@ print(
     fi
     desc+=$'\n'"**Capture window:** $(duration_fmt $capture_duration)"
     desc+=$'\n'"**Transactions:** ${total_txns} (${success_count} success, ${failed_count} failed)"
-    local total_cu_fmt
-    total_cu_fmt=$(printf "%'d" "$total_compute_units" 2>/dev/null || echo "$total_compute_units")
-    desc+=$'\n'"**Total compute units:** ${total_cu_fmt} CU"
+    local avg_cu_per_block=0
+    if (( produced_slots > 0 )); then
+        avg_cu_per_block=$(( total_compute_units / produced_slots ))
+    fi
+    local avg_cu_fmt
+    avg_cu_fmt=$(printf "%'d" "$avg_cu_per_block" 2>/dev/null || echo "$avg_cu_per_block")
+    desc+=$'\n'"**Avg CU/block:** ${avg_cu_fmt} CU (over ${produced_slots} produced)"
     desc+=$'\n'"**Fees earned:** ${total_fees_sol} SOL"
     desc+=$'\n'"**Jito tips earned:** ${total_tips_sol} SOL (tip-PDA inflow during our slots)"
     desc+=$'\n'"**Jito to Validator:** ${jito_to_validator} SOL (${COMMISSION_PCT}% commission)"
@@ -383,13 +394,21 @@ print(
 
     # Update daily ledger and append rolling subtotal (since 18:15 CT)
     local day_line day_fees day_tips day_rev day_n day_tips_to_val day_total_to_val
+    local day_avg_cu day_produced
     day_line=$(update_daily_ledger "$capture_end_time" \
         "$total_fees_sol" "$total_tips_sol" "$total_revenue_sol" \
-        "$total_slots" "$first_slot" "$last_slot")
-    read -r day_fees day_tips day_rev day_n day_tips_to_val day_total_to_val <<< "$day_line"
+        "$total_slots" "$first_slot" "$last_slot" \
+        "$total_compute_units" "$produced_slots")
+    read -r day_fees day_tips day_rev day_n day_tips_to_val day_total_to_val \
+            day_avg_cu day_produced <<< "$day_line"
     local day_label
     day_label=$(central_day_label "$capture_end_time")
     desc+=$'\n'"**Today (${day_label}, since 18:15 CT):** ${day_fees} fees + ${day_tips_to_val} tips (${COMMISSION_PCT}%) = ${day_total_to_val} SOL to validator across ${day_n} rotation(s)"
+    if (( day_produced > 0 )); then
+        local day_avg_cu_fmt
+        day_avg_cu_fmt=$(printf "%'d" "$day_avg_cu" 2>/dev/null || echo "$day_avg_cu")
+        desc+=$'\n'"**Today avg CU/block:** ${day_avg_cu_fmt} CU (over ${day_produced} produced blocks)"
+    fi
 
     if (( withdrawal_count > 0 )); then
         desc+=$'\n'"⚠️ **Tip account withdrawals:** ${withdrawal_count} event(s), ${withdrawal_sol} SOL out — see ${text_file}"
@@ -411,7 +430,7 @@ print(
     log "  Slots: $slot_range ($produced_slots produced, $skipped_slots skipped)"
     log "  Duration: $(duration_fmt $capture_duration)"
     log "  Transactions: $total_txns ($success_count success, $failed_count failed)"
-    log "  Total compute units: ${total_cu_fmt} CU"
+    log "  Avg CU/block: ${avg_cu_fmt} CU (over ${produced_slots} produced)"
     log "  Fees: $total_fees_sol SOL"
     log "  Tips: $total_tips_sol SOL"
     log "  Jito to Validator: $jito_to_validator SOL (${COMMISSION_PCT}%)"
