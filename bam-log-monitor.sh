@@ -2,6 +2,11 @@
 set -uo pipefail
 trap '' PIPE
 
+# Cron's PATH lacks the Solana install dir — without this, apply_bam_switch
+# can't find agave-validator and falls back to socat, which doesn't reliably
+# apply the URL change.
+export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
+
 ###############################################################################
 # BAM Error Monitor for Solana Validator
 # Monitors validator.log for BAM-specific connection errors and metric anomalies.
@@ -44,13 +49,13 @@ if [[ -n "$_bam_url" ]]; then
     NETWORK=$(echo "$_bam_url" | sed -E 's|https?://[^.]+\.([^.]+)\..*|\1|')
 fi
 case "$NETWORK" in
-    mainnet) REGIONS="ams-1 amsterdam dublin dallas frankfurt london lax ny pittsburgh slc singapore tokyo" ;;
+    mainnet) REGIONS="amsterdam dublin dallas frankfurt london lax ny pittsburgh slc singapore tokyo" ;;
     testnet) REGIONS="dallas ny slc" ;;
 esac
 FAIL_THRESHOLD=2
-RECOVERY_THRESHOLD=1
-FO_PING_COUNT=5
-FO_PING_TIMEOUT=2
+RECOVERY_THRESHOLD=5
+FO_PROBE_TIMEOUT=2
+BAM_TCP_PORT=50055
 
 # BAM connection error patterns
 BAM_CONNECTION_PATTERN='BAM connection lost|BAM connection not healthy|Failed to connect to BAM|Failed to start scheduler stream|auth.*fail|Inbound stream closed|Failed to get config'
@@ -241,14 +246,16 @@ make_bam_url() {
 }
 
 ping_bam_region() {
+    # TCP probe to BAM gRPC port — ICMP would succeed even when the BAM service
+    # is down, which caused failover to bounce between broken endpoints.
     local host="${1}.${NETWORK}.bam.jito.wtf"
-    local avg
-    avg=$(ping -c "$FO_PING_COUNT" -W "$FO_PING_TIMEOUT" "$host" 2>/dev/null \
-        | awk -F'/' '/^rtt|^round-trip/ {printf "%.0f", $5}')
-    if [[ -z "$avg" ]]; then
-        echo "timeout"
+    local start_ns end_ns
+    start_ns=$(date +%s%N)
+    if timeout "$FO_PROBE_TIMEOUT" bash -c "exec 3<>/dev/tcp/${host}/${BAM_TCP_PORT}" 2>/dev/null; then
+        end_ns=$(date +%s%N)
+        echo $(( (end_ns - start_ns) / 1000000 ))
     else
-        echo "$avg"
+        echo "timeout"
     fi
 }
 
@@ -517,8 +524,24 @@ print(int((b - a).total_seconds()))
     fi
 
     # ── Failover logic ──────────────────────────────────────────────────
+    # Only treat connection errors as a *current* failure if the most recent
+    # BAM event in this window is still an error. Errors followed later by a
+    # successful "BAM connection established" mean the connection recovered
+    # within the window — counting them would cause a failover loop where the
+    # cron run after a manual recovery still sees the pre-recovery errors.
+    local conn_currently_failing=false
+    if [[ -n "$conn_errors" ]]; then
+        local latest_bam_event
+        latest_bam_event=$(echo "$new_content" \
+            | grep -E "${BAM_CONNECTION_PATTERN}|BAM connection established" \
+            | tail -1)
+        if [[ -n "$latest_bam_event" && "$latest_bam_event" != *"BAM connection established"* ]]; then
+            conn_currently_failing=true
+        fi
+    fi
+
     local has_errors=false
-    [[ -n "$conn_errors" || -n "$metric_errors" ]] && has_errors=true
+    [[ "$conn_currently_failing" == true || -n "$metric_errors" ]] && has_errors=true
 
     local preferred_region current_region
     preferred_region=$(get_preferred_region) || {
