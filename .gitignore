@@ -4,3 +4,5 @@ __pycache__/
 captures/
 daily_totals.jsonl
 daily_totals.jsonl.*
+*.bak
+DEPLOY-MAINNET.md

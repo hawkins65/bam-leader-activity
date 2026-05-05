@@ -56,6 +56,11 @@ FAIL_THRESHOLD=2
 RECOVERY_THRESHOLD=5
 FO_PROBE_TIMEOUT=2
 BAM_TCP_PORT=50055
+# BAM nodes enforce a hard ~30ms upper bound for validators.
+# Skip failover candidates at or above this — they won't stay connected.
+MAX_PING_MS=28
+# Rate-limit the "no viable fallback" Discord alert
+NO_FALLBACK_ALERT_INTERVAL_SEC=3600
 
 # BAM connection error patterns
 BAM_CONNECTION_PATTERN='BAM connection lost|BAM connection not healthy|Failed to connect to BAM|Failed to start scheduler stream|auth.*fail|Inbound stream closed|Failed to get config'
@@ -267,8 +272,16 @@ select_best_region() {
         [[ "$r" == "$exclude" ]] && continue
         local ms
         ms=$(ping_bam_region "$r")
-        debug "Ping $r: ${ms}" >&2
-        if [[ "$ms" != "timeout" ]] && (( ms < best_ms )); then
+        if [[ "$ms" == "timeout" ]]; then
+            debug "Probe $r: timeout (skipping)" >&2
+            continue
+        fi
+        if (( ms >= MAX_PING_MS )); then
+            debug "Probe $r: ${ms}ms (skipping, >= ${MAX_PING_MS}ms BAM latency limit)" >&2
+            continue
+        fi
+        debug "Probe $r: ${ms}ms" >&2
+        if (( ms < best_ms )); then
             best_ms=$ms
             best_region=$r
         fi
@@ -278,6 +291,22 @@ select_best_region() {
     else
         return 1
     fi
+}
+
+maybe_send_no_fallback_alert() {
+    local current_region="$1"
+    local now last_alert elapsed
+    now=$(date -u '+%s')
+    last_alert=$(read_state_file "last_no_fallback_alert" "0")
+    elapsed=$(( now - last_alert ))
+    if (( elapsed < NO_FALLBACK_ALERT_INTERVAL_SEC )); then
+        debug "Suppressing no-fallback alert (last sent ${elapsed}s ago, interval ${NO_FALLBACK_ALERT_INTERVAL_SEC}s)"
+        return
+    fi
+    write_state_file "last_no_fallback_alert" "$now"
+    send_discord "BAM: No Viable Fallback" \
+        "All fallback regions exceed the ${MAX_PING_MS}ms BAM latency limit or are unreachable.\n**Current:** ${current_region}\n**Action:** Holding on current endpoint; will auto-recover when healthy. No failover attempted." \
+        "warning"
 }
 
 apply_bam_switch() {
@@ -318,10 +347,8 @@ do_failover() {
 
     local best_region
     best_region=$(select_best_region "$current_region") || {
-        log "ERROR: No reachable alternative BAM regions"
-        send_discord "BAM Failover Failed" \
-            "No reachable alternative BAM regions.\nCurrent: **${current_region}**\nAll regions unreachable." \
-            "error"
+        log "No viable fallback region (all exceed ${MAX_PING_MS}ms or are unreachable) — holding on $current_region"
+        maybe_send_no_fallback_alert "$current_region"
         return 1
     }
 
@@ -377,7 +404,7 @@ check_recovery() {
 
         if apply_bam_switch "$new_url"; then
             write_state_file "on_fallback" "false"
-            rm -f "$FAILOVER_DIR/fallback_region" "$FAILOVER_DIR/preferred_healthy_count" "$FAILOVER_DIR/fail_count"
+            rm -f "$FAILOVER_DIR/fallback_region" "$FAILOVER_DIR/preferred_healthy_count" "$FAILOVER_DIR/fail_count" "$FAILOVER_DIR/last_no_fallback_alert"
             log "Recovery complete: back to $preferred_region"
             send_discord "BAM Recovery: Back to ${preferred_region}" \
                 "Preferred BAM node is healthy again.\n**Restored:** ${preferred_region}\n**Was on:** ${fallback_region}\n**Time:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" \
@@ -566,13 +593,13 @@ print(int((b - a).total_seconds()))
 
     debug "Failover state: preferred=$preferred_region current=$effective_current on_fallback=$on_fallback has_errors=$has_errors"
 
-    # Detect manual switch-back (operator restarted validator, ps now shows preferred)
-    if [[ "$on_fallback" == "true" && "$current_region" == "$preferred_region" ]]; then
-        log "Manual switch-back detected: now on preferred region $preferred_region"
-        write_state_file "on_fallback" "false"
-        rm -f "$FAILOVER_DIR/fallback_region" "$FAILOVER_DIR/preferred_healthy_count" "$FAILOVER_DIR/fail_count"
-        return
-    fi
+    # NOTE: we intentionally do NOT probe `ps aux` to detect operator-initiated
+    # switch-back. The --bam-url CLI flag is static (always reflects validator.sh),
+    # so ps can never distinguish "runtime on fallback" from "runtime on preferred".
+    # Legitimate recovery — preferred becomes healthy again, whether via auto-heal
+    # or operator intervention — is handled by check_recovery(): the admin-RPC
+    # setBamUrl call is idempotent, so re-issuing it while already on preferred is
+    # a safe no-op that clears our state.
 
     if [[ "$on_fallback" == "true" ]]; then
         # We're on a fallback node
