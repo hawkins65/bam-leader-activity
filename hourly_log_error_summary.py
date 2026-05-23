@@ -18,6 +18,10 @@ from collections import Counter
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+# Skip unless the running validator is using the staked identity.
+if subprocess.run(["/home/sol/bam-leader-activity/role-gate.sh"]).returncode != 0:
+    sys.exit(0)
+
 _webhook_path = Path.home() / ".config" / "discord" / "webhook"
 if _webhook_path.exists():
     DISCORD_WEBHOOK = _webhook_path.read_text().strip()

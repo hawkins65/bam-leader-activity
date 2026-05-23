@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -u
 
+# Skip unless the running validator is using the staked identity.
+/home/sol/bam-leader-activity/role-gate.sh || exit 0
+
 # Redirect all output to log file (avoids systemd StandardOutput=append: FD
 # inheritance issues that cause bash wait/pipefail to deadlock in subshells)
 LOG_FILE="${HOME}/logs/leader-capture-monitor.log"

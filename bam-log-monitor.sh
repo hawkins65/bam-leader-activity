@@ -2,6 +2,9 @@
 set -uo pipefail
 trap '' PIPE
 
+# Skip unless the running validator is using the staked identity.
+/home/sol/bam-leader-activity/role-gate.sh || exit 0
+
 # Cron's PATH lacks the Solana install dir — without this, apply_bam_switch
 # can't find agave-validator and falls back to socat, which doesn't reliably
 # apply the URL change.

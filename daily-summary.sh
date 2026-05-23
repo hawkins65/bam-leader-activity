@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -u
 
+# Skip unless the running validator is using the staked identity.
+/home/sol/bam-leader-activity/role-gate.sh || exit 0
+
 ###############################################################################
 # Daily revenue summary for leader captures.
 #
