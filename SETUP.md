@@ -44,12 +44,20 @@ update.
 
 **Verify:**
 ```bash
-for p in python3 jq curl bc socat ping pgrep; do command -v $p >/dev/null && echo "OK: $p" || echo "MISSING: $p"; done
+for p in python3 jq curl bc socat ping pgrep agave-validator solana solana-keygen; do
+  command -v $p >/dev/null && echo "OK: $p" || echo "MISSING: $p"
+done
 dpkg -s python3-venv >/dev/null 2>&1 && echo "OK: python3-venv" || echo "MISSING: python3-venv"
+test -f "$HOME/validator.sh" && echo "OK: ~/validator.sh" || echo "MISSING: ~/validator.sh"
 ```
 
 `socat` is the admin-RPC fallback path for `bam-log-monitor.sh`. `ping` and
-`pgrep` are used by `set-bam-node.sh` and `lib-env.sh` respectively.
+`pgrep` are used by `set-bam-node.sh` and `lib-env.sh`. `agave-validator`,
+`solana`, and `solana-keygen` come from the Solana install (typically
+`~/.local/share/solana/install/active_release/bin/`); if they're missing,
+install Solana first — nothing in this repo will work without them.
+`~/validator.sh` is the startup script `lib-env.sh` falls back to when the
+validator isn't currently running.
 
 **Fix if missing:**
 ```bash
