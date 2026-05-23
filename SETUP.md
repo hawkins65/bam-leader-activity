@@ -348,9 +348,6 @@ rotate/archive monthly if size becomes an issue.
 # Role-driven BAM URL sync
 ./role-bam-sync.sh
 
-# Capture monitor sees the schedule and picks a window (skips on standby)
-./leader-capture-monitor.sh --once --dry-run --verbose
-
 # Daily summary against whatever's in the ledger (skips on standby)
 ./daily-summary.sh --dry-run
 
