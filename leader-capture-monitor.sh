@@ -70,10 +70,13 @@ COMMISSION_PCT=$(echo "scale=4; $COMMISSION_BPS / 100" | bc -l)
 # Timing configuration
 BUFFER_AFTER_SECONDS=60     # Wait this long after last slot before querying RPC
 MERGE_GAP_SECONDS=180       # Merge groups closer than this (3 minutes)
+MAX_ROTATIONS_PER_WINDOW=6  # Hard cap: never merge more than this many rotations
+MAX_WINDOW_SECONDS=600      # Hard cap: refuse capture windows longer than this
 POLL_INTERVAL_FAR=60        # Poll interval when next slot is far away (>5 min)
 POLL_INTERVAL_NEAR=30       # Poll interval when next slot is near (<5 min)
 NEAR_THRESHOLD=300          # "Near" means within this many seconds (5 min)
 MIN_SLEEP=5                 # Never sleep less than this
+WAIT_PROGRESS_INTERVAL=300  # Emit a progress log every N sec in the completion-wait loop
 
 # RPC-based extraction (BAM bundles don't produce debug logs)
 SLOT_TRANSACTIONS_SCRIPT="$SCRIPT_DIR/slot-transactions.py"
@@ -210,11 +213,22 @@ rpc_call() {
 }
 
 get_slot_duration() {
+    # Returns seconds per slot. Mainnet runs ~0.4s; clamp anything outside
+    # [0.3, 0.8] to the default — a bad value here propagates into the merge
+    # logic and can collapse all leader rotations into one giant window.
     local result
     result=$(rpc_call '{"jsonrpc":"2.0","id":1,"method":"getRecentPerformanceSamples","params":[1]}')
     local dur
-    dur=$(echo "$result" | jq -r 'if .result[0] then (.result[0].samplePeriodSecs / .result[0].numSlots | tostring) else empty end' 2>/dev/null)
-    echo "${dur:-0.000420}"
+    dur=$(echo "$result" | jq -r '
+        if .result[0] and .result[0].numSlots > 0
+        then (.result[0].samplePeriodSecs / .result[0].numSlots | tostring)
+        else empty
+        end' 2>/dev/null)
+    # Sanity-check: reject NaN, empty, or out-of-band values
+    if [[ -z "$dur" ]] || ! awk -v d="$dur" 'BEGIN{exit !(d >= 0.3 && d <= 0.8)}'; then
+        dur="0.420"
+    fi
+    echo "$dur"
 }
 
 get_current_slot() {
@@ -247,6 +261,7 @@ get_capture_windows() {
 
     echo "$result" | jq -r --argjson cs "$current_slot" --argjson es "$epoch_start" \
         --argjson sd "$slot_duration" --argjson mg "$MERGE_GAP_SECONDS" \
+        --argjson maxg "$MAX_ROTATIONS_PER_WINDOW" \
         --arg id "$VALIDATOR_IDENTITY" '
         .result[$id] // empty
         | map(. + $es)
@@ -263,9 +278,11 @@ get_capture_windows() {
             # Phase 2: merge runs closer than mg seconds into windows; each
             # window keeps its member runs so we can emit ONLY the actual
             # leader slots (not the other-validator slots in the merge gap).
+            # Bounded by $maxg so a degenerate sd cannot collapse everything.
             | reduce .[] as $r ([];
                 if length == 0 then [[$r]]
-                elif (($r[0] - .[-1][-1][1]) * $sd) < $mg then
+                elif (($r[0] - .[-1][-1][1]) * $sd) < $mg
+                     and ((.[-1] | length) < $maxg) then
                     (.[0:-1] + [.[-1] + [$r]])
                 else . + [[$r]]
                 end
@@ -482,6 +499,17 @@ run_capture_cycle() {
     log "Next leader window: slots $first_slot-$last_slot ($num_groups group(s), $(duration_fmt $leader_duration_seconds))"
     log "Leader slots start in ~$(duration_fmt $seconds_until_start)"
 
+    # Defense in depth: even with the jq-side cap, refuse to enter a
+    # capture window that would block us for too long. Sleep briefly and
+    # let the next iteration re-derive a sane window.
+    if (( num_groups > MAX_ROTATIONS_PER_WINDOW )) || (( leader_duration_seconds > MAX_WINDOW_SECONDS )); then
+        log "ERROR: window exceeds safety caps (groups=$num_groups max=$MAX_ROTATIONS_PER_WINDOW," \
+            "duration=${leader_duration_seconds}s max=${MAX_WINDOW_SECONDS}s)."
+        log "       Slot duration at scan: ${slot_duration}s. Skipping; will recheck in 60s."
+        sleep 60
+        return 1
+    fi
+
     if (( num_groups > 1 )); then
         log "Merged $num_groups nearby leader rotations into single capture window"
     fi
@@ -542,7 +570,12 @@ run_capture_cycle() {
 
     log "Waiting for leader slots to complete..."
 
-    # Wait through the leader slots + post-buffer for blocks to finalize
+    # Wait through the leader slots + post-buffer for blocks to finalize.
+    # Emit a periodic log line so a stuck wait is visible (see prior incident
+    # where slot_duration=0.00042 collapsed 42 rotations and the script sat
+    # silent in this loop for nearly 48h).
+    local last_progress_log
+    last_progress_log=$(date +%s)
     while true; do
         current_slot=$(get_current_slot)
         if [[ -z "$current_slot" ]]; then
@@ -565,6 +598,18 @@ run_capture_cycle() {
             debug "Past last slot by ${seconds_past}s, waiting for ${BUFFER_AFTER_SECONDS}s post-buffer"
         else
             debug "Still in leader window, $(( -slots_past_end )) slots remaining"
+        fi
+
+        # Periodic visible progress so the script's state is observable
+        local now
+        now=$(date +%s)
+        if (( now - last_progress_log >= WAIT_PROGRESS_INTERVAL )); then
+            local remaining=$(( last_slot - current_slot ))
+            slot_duration=$(get_slot_duration)
+            local secs_remaining
+            secs_remaining=$(printf '%.0f' "$(echo "$remaining * $slot_duration" | bc)")
+            log "  ...still waiting: current=$current_slot, target=$last_slot ($remaining slots / ~$(duration_fmt $secs_remaining))"
+            last_progress_log=$now
         fi
 
         sleep "$POLL_INTERVAL_NEAR"
