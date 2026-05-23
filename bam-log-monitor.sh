@@ -39,7 +39,9 @@ LOOP_INTERVAL=60
 # Failover configuration
 FAILOVER_DIR="$STATE_DIR/failover"
 VALIDATOR_SH="/home/sol/validator.sh"
-LEDGER_DIR="/mnt/ledger"
+# shellcheck source=lib-env.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib-env.sh"
+LEDGER_DIR=$(detect_ledger_dir)
 ADMIN_RPC="${LEDGER_DIR}/admin.rpc"
 # Auto-detect network and regions from validator.sh --bam-url
 NETWORK=""

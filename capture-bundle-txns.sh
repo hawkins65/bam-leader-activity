@@ -16,7 +16,9 @@
 set -e
 
 # Configuration
-LEDGER_DIR="/mnt/ledger"
+# shellcheck source=lib-env.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib-env.sh"
+LEDGER_DIR=$(detect_ledger_dir)
 LOG_FILE="$HOME/logs/validator.log"
 CAPTURE_DURATION=3  # 5 minutes in seconds
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"

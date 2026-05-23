@@ -10,7 +10,8 @@
 # Typical caller:   /home/sol/bam-leader-activity/role-gate.sh || exit 0
 #
 # Discovery is self-contained, no external config required:
-#   - LEDGER_DIR is parsed from --ledger in ~/validator.sh.
+#   - LEDGER_DIR is read from the running agave-validator process (via
+#     detect_ledger_dir in lib-env.sh).
 #   - Staked / unstaked keypairs are found by filename convention under
 #     $HOME: *staked-identity-*.json and *unstaked-identity-*.json.
 #   - Their pubkeys are derived with solana-keygen.
@@ -22,11 +23,9 @@ set -uo pipefail
 # Cron's PATH lacks the Solana install dir.
 export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
 
-VALIDATOR_SH="$HOME/validator.sh"
-[[ -f "$VALIDATOR_SH" ]] || { echo "role-gate: $VALIDATOR_SH not found" >&2; exit 2; }
-
-LEDGER_DIR=$(grep -oP '(?<=--ledger )\S+' "$VALIDATOR_SH" | head -1)
-[[ -n "$LEDGER_DIR" ]] || { echo "role-gate: --ledger not found in $VALIDATOR_SH" >&2; exit 2; }
+# shellcheck source=lib-env.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib-env.sh"
+LEDGER_DIR=$(detect_ledger_dir)
 
 shopt -s nullglob
 _unstaked_files=("$HOME"/*unstaked-identity-*.json)
