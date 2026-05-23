@@ -113,21 +113,24 @@ else
 fi
 ```
 
-**Fix if missing** (create only if the file doesn't exist — if it exists but
-a key is missing, edit in place instead):
+**Fix if missing — never overwrites an existing file:**
 ```bash
 mkdir -p ~/.config/validator
-cat > ~/.config/validator/rpc.conf <<'EOF'
-# Sourced by monitoring scripts — do NOT commit.
-MAINNET_RPC_URL=https://your-mainnet-rpc/
-MAINNET_RPC_URL_ALT=https://your-mainnet-rpc-fallback/
-TESTNET_RPC_URL=https://api.testnet.solana.com/
-VALIDATOR_IDENTITY=YourValidatorPubkeyHere
-VALIDATOR_IDENTITY_KEYPAIR=/home/sol/validator-keypair.json
-VOTE_ACCOUNT=YourVoteAccountPubkey
-EOF
+# cp -n = no-clobber: silently does nothing if rpc.conf already exists
+cp -n ~/bam-leader-activity/rpc.conf.example ~/.config/validator/rpc.conf
 chmod 600 ~/.config/validator/rpc.conf
+$EDITOR ~/.config/validator/rpc.conf   # fill in real values on a fresh file
 ```
+
+If the verify step above reported `MISSING: <KEY>` for an existing file,
+**don't `cp` over it** — open it in your editor and append the missing
+keys (find them in `rpc.conf.example`). Existing values are never touched
+by this flow.
+
+The template enumerates every key used by repo scripts plus the
+host-side keys (Telegram, CoinMarketCap, etc.) that scripts outside
+this repo read from the same file. Comment out or remove what you
+don't use.
 
 Network detection (`detect-network.sh`) reads `~/validator.sh`. On testnet,
 ensure the startup script contains a testnet entrypoint

@@ -1,0 +1,38 @@
+# rpc.conf.example — template for ~/.config/validator/rpc.conf
+#
+# Sourced by monitoring scripts as bash. Copy to its real location, fill in
+# values for this host, restrict permissions, then never commit it:
+#
+#   mkdir -p ~/.config/validator
+#   cp ~/bam-leader-activity/rpc.conf.example ~/.config/validator/rpc.conf
+#   chmod 600 ~/.config/validator/rpc.conf
+#   $EDITOR ~/.config/validator/rpc.conf
+#
+# Network detection picks MAINNET_RPC_URL vs TESTNET_RPC_URL at runtime —
+# both can be populated; only the one matching this host's network is used.
+
+# ── RPC endpoints (used by this repo) ─────────────────────────────────
+# leader-capture-monitor.sh, daily-summary.sh, slot-transactions.py
+MAINNET_RPC_URL="https://your-mainnet-rpc/"
+MAINNET_RPC_URL_ALT="https://your-mainnet-rpc-fallback/"
+TESTNET_RPC_URL="https://api.testnet.solana.com/"
+
+# ── Validator identities (used by this repo) ──────────────────────────
+# VALIDATOR_IDENTITY:         this host's staked pubkey
+# VALIDATOR_IDENTITY_KEYPAIR: path to the active keypair file (usually
+#                             ~/identity.json, the symlink managed by
+#                             set_identity_*.sh)
+# VOTE_ACCOUNT, COGENT_IDENTITY: used by host-side scripts outside this repo
+VALIDATOR_IDENTITY="YourStakedPubkeyHere"
+VALIDATOR_IDENTITY_KEYPAIR="/home/sol/identity.json"
+VOTE_ACCOUNT="YourVoteAccountPubkeyHere"
+COGENT_IDENTITY=""
+
+# ── Notifications (used by host scripts outside this repo) ────────────
+# Leave blank or remove the lines if you don't use them.
+TELEGRAM_BOT_TOKEN=""
+TELEGRAM_CHAT_ID=""
+DISCORD_WEBHOOK_COLLECT_BALANCE=""
+
+# ── API keys (used by host scripts outside this repo) ─────────────────
+COINMARKETCAP_API_KEY=""
