@@ -44,25 +44,24 @@ update.
 
 **Verify:**
 ```bash
-for p in python3 jq curl bc socat ping pgrep agave-validator solana solana-keygen; do
+for p in python3 jq curl bc ping pgrep agave-validator solana solana-keygen; do
   command -v $p >/dev/null && echo "OK: $p" || echo "MISSING: $p"
 done
 dpkg -s python3-venv >/dev/null 2>&1 && echo "OK: python3-venv" || echo "MISSING: python3-venv"
 test -f "$HOME/validator.sh" && echo "OK: ~/validator.sh" || echo "MISSING: ~/validator.sh"
 ```
 
-`socat` is the admin-RPC fallback path for `bam-log-monitor.sh`. `ping` and
-`pgrep` are used by `set-bam-node.sh` and `lib-env.sh`. `agave-validator`,
-`solana`, and `solana-keygen` come from the Solana install (typically
-`~/.local/share/solana/install/active_release/bin/`); if they're missing,
-install Solana first — nothing in this repo will work without them.
-`~/validator.sh` is the startup script `lib-env.sh` falls back to when the
-validator isn't currently running.
+`ping` and `pgrep` are used by `set-bam-node.sh` and `lib-env.sh`.
+`agave-validator`, `solana`, and `solana-keygen` come from the Solana
+install (typically `~/.local/share/solana/install/active_release/bin/`);
+if they're missing, install Solana first — nothing in this repo will work
+without them. `~/validator.sh` is the startup script `lib-env.sh` falls
+back to when the validator isn't currently running.
 
 **Fix if missing:**
 ```bash
 sudo apt-get update
-sudo apt-get install -y python3 python3-venv python3-pip jq curl bc socat iputils-ping procps
+sudo apt-get install -y python3 python3-venv python3-pip jq curl bc iputils-ping procps
 ```
 
 ## 3. Python environment
@@ -264,46 +263,53 @@ Tail: `tail -f ~/logs/leader-capture-monitor.log`.
 
 ## 9. Cron entries
 
-Full intended crontab for the `sol` user. The same set works on primary
-and standby — `role-gate.sh` makes each script self-skip when not the
-intended role.
+The repo ships `install-cron.sh` — an idempotent installer that manages a
+marker-delimited block in the `sol` user's crontab. The same set works on
+primary and standby; `role-gate.sh` makes each script self-skip when not
+the intended role.
 
-```cron
-# Log monitoring - error detection every 5 minutes
-*/5 * * * * /home/sol/bash/monitor_log_errors.sh --once >> /home/sol/logs/log_monitor.log 2>&1
-
-# Hourly AI-powered log error summary (gated to primary)
-0 * * * * /home/sol/python/venv/bin/python3 /home/sol/bam-leader-activity/hourly_log_error_summary.py >> /home/sol/logs/hourly_log_summary.log 2>&1
-
-# BAM error monitoring every 5 minutes (gated to primary)
-*/5 * * * * /home/sol/bam-leader-activity/bam-log-monitor.sh --once >> /home/sol/logs/bam_monitor.log 2>&1
-
-# BAM URL role sync — every 5 minutes (BAM on/off by current validator role)
-*/5 * * * * /home/sol/bam-leader-activity/role-bam-sync.sh >> /home/sol/logs/role_bam_sync.log 2>&1
-
-# Daily leader revenue summary — fires 18:15 America/Chicago (gated to primary)
-CRON_TZ=America/Chicago
-15 18 * * * /home/sol/bam-leader-activity/daily-summary.sh
-```
-
-**Verify** which entries are already installed:
+**Verify (read-only diff, exit 0 = up to date, 1 = changes pending):**
 ```bash
-crontab -l 2>/dev/null | grep -E "monitor_log_errors|hourly_log_error_summary|bam-log-monitor|role-bam-sync|daily-summary" || echo "MISSING: no matching cron entries"
-crontab -l 2>/dev/null | grep -q "^CRON_TZ=America/Chicago" && echo "OK: CRON_TZ set" || echo "MISSING: CRON_TZ=America/Chicago"
+~/bam-leader-activity/install-cron.sh --check
 ```
 
-**Fix if missing** — `crontab -e` and add only the lines that didn't appear
-above. Do NOT replace the whole crontab. The `CRON_TZ=America/Chicago` line
-must sit immediately above the `daily-summary.sh` entry (any later entries
-will also inherit that TZ — add `CRON_TZ=UTC` below them if that's wrong).
+**Fix (apply changes — shows diff, prompts before writing):**
+```bash
+~/bam-leader-activity/install-cron.sh        # interactive (recommended)
+~/bam-leader-activity/install-cron.sh --yes  # non-interactive (automation)
+```
+
+What the installer does:
+
+- Manages a block delimited by `# BEGIN bam-leader-activity (managed by install-cron.sh)`
+  and `# END bam-leader-activity`. Re-running replaces the block in place.
+- On first install, **absorbs** pre-existing crontab entries that reference
+  the managed commands (with their comment + adjacent `CRON_TZ`) so the
+  managed block becomes the single source of truth. Cron entries outside
+  the block that don't reference managed commands are never touched.
+- Brackets the daily-summary entry with `CRON_TZ=America/Chicago` above and
+  `CRON_TZ=UTC` below, so entries outside the block stay in their original TZ.
+- Pre-flight warns about missing target files (e.g. no Python venv, no
+  `~/logs`) but does not block installation.
+
+Managed entries:
+
+| Schedule | Command | Role |
+|---|---|---|
+| `*/5` | `/home/sol/bash/monitor_log_errors.sh --once` | (external script) |
+| `0 * * * *` | `hourly_log_error_summary.py` | primary only |
+| `*/5` | `bam-log-monitor.sh --once` | primary only |
+| `*/5` | `role-bam-sync.sh` | both — drives BAM by role |
+| `15 18 * * *` (America/Chicago) | `daily-summary.sh` | primary only |
+
+To remove: `crontab -e` and delete the lines between the BEGIN/END markers.
 
 Notes:
 
-- `CRON_TZ=America/Chicago` applies to every entry **below** it, so keep
-  the daily-summary entry last (or duplicate `CRON_TZ=UTC` before any
-  later entries that must stay in UTC).
-- `monitor_log_errors.sh` lives in `/home/sol/bash/` (not this repo). If
-  you don't use it, drop that line.
+- `monitor_log_errors.sh` lives in `/home/sol/bash/` (not this repo). If a
+  given host doesn't use it, edit the entry out via `crontab -e` after
+  install (`install-cron.sh` puts it in unconditionally to match
+  org-standard hosts).
 - `hourly_log_error_summary.py` needs whatever API credentials the script
   expects (check the file for `os.environ` reads) — configure before
   enabling.

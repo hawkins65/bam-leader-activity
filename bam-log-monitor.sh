@@ -5,9 +5,7 @@ trap '' PIPE
 # Skip unless the running validator is using the staked identity.
 /home/sol/bam-leader-activity/role-gate.sh || exit 0
 
-# Cron's PATH lacks the Solana install dir — without this, apply_bam_switch
-# can't find agave-validator and falls back to socat, which doesn't reliably
-# apply the URL change.
+# Cron's PATH lacks the Solana install dir, where agave-validator lives.
 export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
 
 ###############################################################################
@@ -42,7 +40,6 @@ VALIDATOR_SH="/home/sol/validator.sh"
 # shellcheck source=lib-env.sh
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib-env.sh"
 LEDGER_DIR=$(detect_ledger_dir)
-ADMIN_RPC="${LEDGER_DIR}/admin.rpc"
 # Auto-detect network and regions from validator.sh --bam-url
 NETWORK=""
 REGIONS=""
@@ -316,34 +313,13 @@ maybe_send_no_fallback_alert() {
 
 apply_bam_switch() {
     local url="$1"
-
-    # Method 1: agave-validator CLI (preferred)
     local cli_out
     if cli_out=$(agave-validator --ledger "$LEDGER_DIR" set-bam-config --bam-url "$url" 2>&1); then
         debug "setBamUrl via CLI: $cli_out"
         return 0
     fi
-    log "WARNING: agave-validator CLI failed: $cli_out — trying socat fallback"
-
-    # Method 2: socat to admin.rpc (fallback)
-    if [[ ! -S "$ADMIN_RPC" ]]; then
-        log "ERROR: Admin RPC socket not found at $ADMIN_RPC"
-        return 1
-    fi
-    local resp
-    resp=$(echo "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"setBamUrl\",\"params\":[\"${url}\"]}" \
-        | socat - UNIX-CONNECT:"$ADMIN_RPC" 2>&1)
-    local rc=$?
-    if (( rc != 0 )); then
-        log "ERROR: socat failed (rc=$rc): $resp"
-        return 1
-    fi
-    if echo "$resp" | grep -q '"error"'; then
-        log "ERROR: setBamUrl returned error: $resp"
-        return 1
-    fi
-    debug "setBamUrl via socat: $resp"
-    return 0
+    log "ERROR: agave-validator set-bam-config failed: $cli_out"
+    return 1
 }
 
 do_failover() {
