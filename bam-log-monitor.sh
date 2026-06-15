@@ -54,6 +54,12 @@ case "$NETWORK" in
     mainnet) REGIONS="amsterdam dublin dallas frankfurt london lax ny pittsburgh slc singapore tokyo" ;;
     testnet) REGIONS="dallas ny slc" ;;
 esac
+# Runtime BAM-node switching is OWNED by ~/bam-failover.sh (cron */10), which
+# handles the special-case "switch to BAM-by-IP after the cutoff" target. This
+# monitor must therefore DETECT/ALERT only and NOT switch the node itself, or the
+# two would fight (esp. post-cutoff: failover wants the direct IP, this wants a
+# region). Set true only if bam-failover.sh is removed and this owns switching.
+FAILOVER_ENABLED=false
 FAIL_THRESHOLD=2
 RECOVERY_THRESHOLD=5
 FO_PROBE_TIMEOUT=2
@@ -550,6 +556,14 @@ print(int((b - a).total_seconds()))
 
     local has_errors=false
     [[ "$conn_currently_failing" == true || -n "$metric_errors" ]] && has_errors=true
+
+    # Switching is owned by bam-failover.sh — this monitor only alerts (offset
+    # advancement and error/metric Discord alerts already happened above). Bail
+    # before any do_failover/check_recovery so we never fight bam-failover.sh.
+    if ! $FAILOVER_ENABLED; then
+        debug "FAILOVER_ENABLED=false — alert-only; runtime switching left to bam-failover.sh"
+        return
+    fi
 
     local preferred_region current_region
     preferred_region=$(get_preferred_region) || {

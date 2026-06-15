@@ -5,16 +5,22 @@
 # Apply mechanism: agave-validator CLI (`set-bam-config --bam-url`).
 #
 # Usage:
-#   bash set-bam-node.sh [region] [--mainnet|--testnet]
+#   bash set-bam-node.sh [region|ip|hostname] [--mainnet|--testnet]
 #
 # Examples:
 #   bash set-bam-node.sh slc              # set to slc on default network
 #   bash set-bam-node.sh --testnet        # interactive region picker for testnet
 #   bash set-bam-node.sh ny --mainnet     # set to ny on mainnet
+#   bash set-bam-node.sh 10.0.0.5         # set BAM to a specific IP   (health-verified)
+#   bash set-bam-node.sh bam.example.com  # set BAM to a specific host (health-verified)
 #   bash set-bam-node.sh --off            # disable BAM
 #   bash set-bam-node.sh --auto           # non-interactive: pick lowest-latency
 #                                         # healthy region and apply (used by
 #                                         # role-bam-sync.sh on primary).
+#
+# Passing a raw IP or hostname is non-interactive: the node is health-checked
+# first and the switch is REFUSED (exit 1) if it isn't healthy, so it's safe
+# to call from automation.
 #
 
 set -euo pipefail
@@ -28,9 +34,41 @@ PING_THRESHOLD_MS=30
 PING_COUNT=3
 # ─────────────────────────────────────────────────────────────────────
 
-# BAM regions per network — sourced from https://bam.dev/validators/#step-3-choose-your-region
-MAINNET_REGIONS="amsterdam dallas dublin frankfurt london lax ny pittsburgh siauliai slc singapore tokyo"
-TESTNET_REGIONS="dallas ny slc frankfurt"
+# ── BAM regions per network ──────────────────────────────────────────
+# Fetched live from the official BAM validators page so the list never
+# drifts from https://bam.dev/validators/#step-3-choose-your-region.
+# Falls back to a baked-in snapshot only if the page is unreachable, so
+# automation (role-bam-sync, failover) keeps working during an outage.
+BAM_REGIONS_URL="https://bam.dev/validators/"
+FALLBACK_MAINNET_REGIONS="amsterdam dallas dublin frankfurt lax london ny pittsburgh siauliai singapore slc tokyo"
+FALLBACK_TESTNET_REGIONS="dallas frankfurt ny slc"
+
+# Scrape <region>.<network>.bam.jito.wtf hostnames from the page and echo a
+# space-separated, de-duplicated region list. Empty echo on any failure.
+fetch_regions() {
+    local network="$1" html out
+    html=$(curl -fsS -m 10 "$BAM_REGIONS_URL" 2>/dev/null) || { echo ""; return 0; }
+    out=$(printf '%s' "$html" \
+        | grep -oE "[a-z0-9-]+\.${network}\.bam\.jito\.wtf" \
+        | sed -E "s/\.${network}\..*//" \
+        | sort -u | paste -sd' ' || true)
+    echo "$out"
+    return 0
+}
+
+# Live region list for a network, falling back to the snapshot on failure.
+get_regions() {
+    local network="$1" regions=""
+    regions=$(fetch_regions "$network")
+    if [[ -z "$regions" ]]; then
+        case "$network" in
+            mainnet) regions="$FALLBACK_MAINNET_REGIONS" ;;
+            testnet) regions="$FALLBACK_TESTNET_REGIONS" ;;
+        esac
+        echo "Warning: could not fetch BAM region list from ${BAM_REGIONS_URL}; using built-in fallback." >&2
+    fi
+    echo "$regions"
+}
 
 # ── Parse args ───────────────────────────────────────────────────────
 NETWORK=""
@@ -49,8 +87,26 @@ for arg in "$@"; do
     esac
 done
 
+# ── Detect whether the positional arg is a raw IP/hostname ───────────
+# Region names are bare single tokens (slc, ny). Anything with a dot
+# (IPv4 or FQDN) or a colon (host:port) is treated as a direct BAM host
+# to set verbatim — bypassing the region map, the network requirement,
+# and the full cluster probe.
+is_direct_host() {
+    local s="$1"
+    [[ "$s" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(:[0-9]+)?$ ]] && return 0   # IPv4[:port]
+    [[ "$s" == *.* || "$s" == *:* ]] && return 0                         # FQDN or host:port
+    return 1
+}
+
+TARGET_HOST=""
+if [[ -n "$REGION" ]] && is_direct_host "$REGION"; then
+    TARGET_HOST="$REGION"
+    REGION=""
+fi
+
 # ── Auto-detect network if not specified on command line ─────────────
-if [[ -z "$NETWORK" ]]; then
+if [[ -z "$NETWORK" && -z "$TARGET_HOST" ]]; then
     DETECTED=""
 
     # Method 1: solana config get — check RPC URL
@@ -99,10 +155,12 @@ if [[ -z "$NETWORK" ]]; then
     fi
 fi
 
-if [[ "$NETWORK" == "mainnet" ]]; then
-    REGIONS="$MAINNET_REGIONS"
+if [[ -n "$TARGET_HOST" ]]; then
+    REGIONS=""                       # direct host — region map not used
+elif [[ "$NETWORK" == "mainnet" ]]; then
+    REGIONS=$(get_regions mainnet)
 elif [[ "$NETWORK" == "testnet" ]]; then
-    REGIONS="$TESTNET_REGIONS"
+    REGIONS=$(get_regions testnet)
 else
     echo "Invalid network: $NETWORK (use mainnet or testnet)"
     exit 1
@@ -202,9 +260,9 @@ disable_bam() {
 # ── Build URL from region ───────────────────────────────────────────
 make_url() { echo "http://${1}.${NETWORK}.bam.jito.wtf"; }
 
-# ── Ping a BAM host, return avg latency in ms (integer) ─────────────
-ping_region() {
-    local host="${1}.${NETWORK}.bam.jito.wtf"
+# ── Ping a raw host, return avg latency in ms (integer) or "timeout" ─
+ping_host() {
+    local host="$1"
     local count="${2:-$PING_COUNT}"
     local avg
     avg=$(ping -c "$count" -W 1 "$host" 2>/dev/null \
@@ -216,6 +274,9 @@ ping_region() {
     fi
 }
 
+# Region wrapper — pings <region>.<network>.bam.jito.wtf
+ping_region() { ping_host "${1}.${NETWORK}.bam.jito.wtf" "${2:-$PING_COUNT}"; }
+
 # ── Health-check a BAM node via /api/v1/health/* ────────────────────
 # Returns: ok | unhealthy:<reason> | down
 # Uses if/elif (not [[ ]] && {...}) because we run inside set -e and a
@@ -224,8 +285,8 @@ ping_region() {
 # BAM rate-limits to ~1 call/sec/server/source-IP, so we sleep 1s between
 # the two health calls. Running per-region in a bg job, this adds ~1s
 # wallclock but stays under the 429 threshold.
-bam_health_check() {
-    local host="${1}.${NETWORK}.bam.jito.wtf"
+bam_health_check_host() {
+    local host="$1"
     local resp sd
 
     resp=$(curl -sS -m 3 "http://${host}:9090/api/v1/health/validator" 2>/dev/null) || { echo "down"; return 0; }
@@ -245,6 +306,9 @@ bam_health_check() {
     fi
     return 0
 }
+
+# Region wrapper — health-checks <region>.<network>.bam.jito.wtf
+bam_health_check() { bam_health_check_host "${1}.${NETWORK}.bam.jito.wtf"; }
 
 # ── BAM-side: does our identity appear in this region's roster? ─────
 # Returns heartbeat_age_ms (digits) if found, empty otherwise.
@@ -329,6 +393,70 @@ apply_bam_url() {
     return 1
 }
 
+# Apply a URL and exit with the real result. Terminal apply points used this
+# followed by an unconditional `exit 0`, which only avoided reporting success on
+# a failed apply because `set -e` aborted first — fragile and misleading. The
+# `if` makes the exit code explicit (0 set / 1 failed) without relying on errexit.
+apply_and_exit() {
+    local url="$1"
+    if apply_bam_url "$url"; then
+        exit 0
+    fi
+    echo -e "${RED}Did not switch BAM to ${url}.${RESET}" >&2
+    exit 1
+}
+
+# ── Direct IP/hostname target: verify health, then set verbatim ──────
+# Non-interactive by design (automation-safe): if the node isn't healthy
+# we refuse to switch and exit non-zero. The BAM health endpoint
+# (/api/v1/health on :9090) is authoritative; ping latency is shown for
+# context only, since ICMP may be filtered even when BAM is reachable.
+set_direct_host() {
+    local input="$1"
+    local host="${input#http://}"; host="${host#https://}"
+    host="${host%%/*}"                 # strip any path
+    local probe_host="${host%%:*}"     # host without :port for probing
+    local url="http://${host}"
+
+    echo -e "${BOLD}Verifying BAM node ${host} before switching...${RESET}"
+
+    local latency health lat_disp
+    latency=$(ping_host "$probe_host")
+    health=$(bam_health_check_host "$probe_host")
+
+    lat_disp="$latency"
+    [[ "$latency" != "timeout" ]] && lat_disp="${latency}ms"
+    printf "  %-24s  %-10s  %s\n" "Host"  "Latency"  "Health"
+    printf "  %-24s  %-10s  %s\n" "$host" "$lat_disp" "$health"
+    echo ""
+
+    # Gate 1: BAM health must be ok (authoritative).
+    if [[ "$health" != "ok" ]]; then
+        echo -e "${RED}${host} is NOT healthy (BAM health: ${health}).${RESET}"
+        echo -e "${RED}Did not switch BAM to ${host}.${RESET}"
+        exit 1
+    fi
+
+    # Gate 2: latency must be within threshold when measurable. ICMP may be
+    # filtered on a raw host even while BAM is reachable, so a ping timeout
+    # is a warning (proceed), not a failure; an over-threshold RTT is refused.
+    if [[ "$latency" == "timeout" ]]; then
+        echo -e "${YELLOW}${host} is healthy but latency is unknown (ICMP filtered/blocked). Proceeding.${RESET}"
+    elif (( latency > PING_THRESHOLD_MS )); then
+        echo -e "${RED}${host} is healthy but latency is ${latency}ms (threshold: ${PING_THRESHOLD_MS}ms).${RESET}"
+        echo -e "${RED}Did not switch BAM to ${host}.${RESET}"
+        exit 1
+    else
+        echo -e "${GREEN}${host} is healthy (${latency}ms). Proceeding.${RESET}"
+    fi
+
+    if apply_bam_url "$url"; then
+        exit 0
+    fi
+    echo -e "${RED}Failed to set BAM to ${host}.${RESET}"
+    exit 1
+}
+
 # ── Interactive picker — uses already-populated probe arrays ────────
 show_picker() {
     declare -a GOOD_REGIONS=()
@@ -388,18 +516,20 @@ show_picker() {
     fi
 
     if (( CHOICE == 0 )); then
-        disable_bam
-        exit 0
+        if disable_bam; then
+            exit 0
+        fi
+        exit 1
     fi
 
     SELECTED="${GOOD_REGIONS[$((CHOICE - 1))]}"
-    apply_bam_url "$(make_url "$SELECTED")"
+    apply_and_exit "$(make_url "$SELECTED")"
 }
 
 # ── Probe BAM cluster once (parallel: ping + health + identity) ──────
 # Skipped for --off. Results are reused by detect_current_bam,
 # show_picker, and the explicit-region path — no double-probe.
-if ! $DISABLE; then
+if ! $DISABLE && [[ -z "$TARGET_HOST" ]]; then
     echo -e "${BOLD}Probing all BAM endpoints for ${NETWORK} (parallel: ping + health + identity)...${RESET}"
     probe_all_regions
     echo ""
@@ -426,8 +556,15 @@ echo ""
 
 # ── --off branch: disable BAM and exit ───────────────────────────────
 if $DISABLE; then
-    disable_bam
-    exit 0
+    if disable_bam; then
+        exit 0
+    fi
+    exit 1
+fi
+
+# ── Direct IP/hostname target: health-verify, then set and exit ──────
+if [[ -n "$TARGET_HOST" ]]; then
+    set_direct_host "$TARGET_HOST"   # exits 0 (set) or 1 (unhealthy/failed)
 fi
 
 # ── --auto branch: pick lowest-latency healthy region, apply if needed
@@ -460,8 +597,7 @@ if $AUTO; then
     fi
 
     echo -e "--auto: best healthy region is ${GREEN}${BOLD}${BEST_REGION}${RESET} (${BEST_MS}ms)"
-    apply_bam_url "$DESIRED_URL"
-    exit 0
+    apply_and_exit "$DESIRED_URL"
 fi
 
 # ── Validate explicit region ────────────────────────────────────────
@@ -521,7 +657,7 @@ if [[ -n "$REGION" ]]; then
             case "$ANSWER" in
                 q|Q) echo "Cancelled."; exit 0 ;;
                 p|P) echo ""; show_picker ;;
-                *)   apply_bam_url "$(make_url "$BEST_REGION")" ;;
+                *)   apply_and_exit "$(make_url "$BEST_REGION")" ;;
             esac
         else
             echo -e "${RED}No reachable + healthy regions found.${RESET}"
@@ -537,16 +673,16 @@ if [[ -n "$REGION" ]]; then
             echo -ne "  [b] Use ${BEST_REGION}  [y] Use ${REGION} anyway  [p] Pick from list  [q] Quit: "
             read -r ANSWER
             case "$ANSWER" in
-                y|Y) apply_bam_url "$(make_url "$REGION")" ;;
+                y|Y) apply_and_exit "$(make_url "$REGION")" ;;
                 q|Q) echo "Cancelled."; exit 0 ;;
                 p|P) echo ""; show_picker ;;
-                *)   apply_bam_url "$(make_url "$BEST_REGION")" ;;
+                *)   apply_and_exit "$(make_url "$BEST_REGION")" ;;
             esac
         else
             echo -ne "  No healthy regions under threshold. [y] Use ${REGION} anyway  [q] Quit: "
             read -r ANSWER
             case "$ANSWER" in
-                y|Y) apply_bam_url "$(make_url "$REGION")" ;;
+                y|Y) apply_and_exit "$(make_url "$REGION")" ;;
                 *)   echo "Cancelled."; exit 0 ;;
             esac
         fi
@@ -559,16 +695,16 @@ if [[ -n "$REGION" ]]; then
             echo -ne "  [b] Use ${BEST_REGION}  [y] Use ${REGION} anyway  [p] Pick from list  [q] Quit: "
             read -r ANSWER
             case "$ANSWER" in
-                y|Y) apply_bam_url "$(make_url "$REGION")" ;;
+                y|Y) apply_and_exit "$(make_url "$REGION")" ;;
                 q|Q) echo "Cancelled."; exit 0 ;;
                 p|P) echo ""; show_picker ;;
-                *)   apply_bam_url "$(make_url "$BEST_REGION")" ;;
+                *)   apply_and_exit "$(make_url "$BEST_REGION")" ;;
             esac
         else
             echo -ne "  No healthy regions found. [y] Use ${REGION} anyway  [q] Quit: "
             read -r ANSWER
             case "$ANSWER" in
-                y|Y) apply_bam_url "$(make_url "$REGION")" ;;
+                y|Y) apply_and_exit "$(make_url "$REGION")" ;;
                 *)   echo "Cancelled."; exit 0 ;;
             esac
         fi
@@ -580,16 +716,18 @@ if [[ -n "$REGION" ]]; then
             echo -ne "  [enter] Use ${REGION}  [b] Use ${BEST_REGION} instead  [q] Quit: "
             read -r ANSWER
             case "$ANSWER" in
-                b|B) apply_bam_url "$(make_url "$BEST_REGION")" ;;
+                b|B) apply_and_exit "$(make_url "$BEST_REGION")" ;;
                 q|Q) echo "Cancelled."; exit 0 ;;
-                *)   apply_bam_url "$(make_url "$REGION")" ;;
+                *)   apply_and_exit "$(make_url "$REGION")" ;;
             esac
         else
             echo -e "${GREEN}${REGION} is the best option at ${REQUESTED_MS}ms (healthy). Proceeding.${RESET}"
-            apply_bam_url "$(make_url "$REGION")"
+            apply_and_exit "$(make_url "$REGION")"
         fi
     fi
-    exit 0
+    # Unreachable: every branch above applies (apply_and_exit) or exits. If we
+    # ever fall through here, nothing was set — fail rather than report success.
+    exit 1
 fi
 
 # ── No region specified — go straight to picker ─────────────────────
