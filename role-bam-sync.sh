@@ -19,7 +19,7 @@ set -uo pipefail
 
 REPO_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 ROLE_GATE="$REPO_DIR/role-gate.sh"
-SET_BAM="$REPO_DIR/set-bam-node.sh"
+SET_BAM="/home/sol/set-bam-node.sh"
 
 # Cron's PATH lacks the Solana install dir.
 export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"

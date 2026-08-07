@@ -195,7 +195,7 @@ Repo scripts involved:
 |---|---|
 | `lib-env.sh` | Sourceable; `detect_ledger_dir()` reads `--ledger` from the running validator process (falls back to `~/validator.sh`, then `/mnt/ledger`). |
 | `role-gate.sh` | Exit 0 = primary, 1 = standby, 2 = error (validator down, keypair files missing, identity mismatch). |
-| `set-bam-node.sh` | Apply BAM URL: interactive picker, explicit region, `--off`, or `--auto`. |
+| `set-bam-node-full.sh` | Apply BAM URL: interactive picker, explicit region, `--off`, or `--auto`. Invoked as `~/set-bam-node.sh`, a thin wrapper that `exec`s this file — callers use the wrapper path, not this one. |
 | `role-bam-sync.sh` | Cron entry point: dispatches `--auto` on primary, `--off` on standby. |
 
 **Verify keypair files** — exactly one staked and one unstaked file must

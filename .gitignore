@@ -5,3 +5,7 @@ captures/
 daily_totals.jsonl
 daily_totals.jsonl.*
 *.bak
+
+# transient: dated backups and ad-hoc `at` job output
+*.bak-*
+at-*.log

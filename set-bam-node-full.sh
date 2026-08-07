@@ -40,8 +40,30 @@ PING_COUNT=3
 # Falls back to a baked-in snapshot only if the page is unreachable, so
 # automation (role-bam-sync, failover) keeps working during an outage.
 BAM_REGIONS_URL="https://bam.dev/validators/"
-FALLBACK_MAINNET_REGIONS="amsterdam dallas dublin frankfurt lax london ny pittsburgh siauliai singapore slc tokyo"
-FALLBACK_TESTNET_REGIONS="dallas frankfurt ny slc"
+# IATA airport codes — matches what the page now advertises. BAM's DNS
+# still resolves the old city names too, but we key everything off the
+# codes and translate legacy names via REGION_ALIASES below.
+FALLBACK_MAINNET_REGIONS="ams dfw dub ewr fra iad lax lon pit sin slc sqq tyo"
+FALLBACK_TESTNET_REGIONS="dfw ewr fra sea slc"
+
+# ── Legacy city name → IATA code aliases ─────────────────────────────
+# BAM renamed its regions from city names to IATA airport codes but its
+# DNS still resolves the old names. We accept either spelling on the
+# command line by folding a legacy/city name to the IATA code the page
+# now uses; the interactive picker only ever shows the scraped IATA codes.
+declare -A REGION_ALIASES=(
+    [amsterdam]=ams   [ashburn]=iad     [dallas]=dfw      [dublin]=dub
+    [frankfurt]=fra   [london]=lon      [losangeles]=lax  [newyork]=ewr
+    [ny]=ewr          [pittsburgh]=pit  [saltlakecity]=slc
+    [seattle]=sea     [siauliai]=sqq    [singapore]=sin   [tokyo]=tyo
+)
+
+# Normalize a region token: lowercase, then map any legacy/city name to
+# its IATA code. Unknown tokens pass through unchanged (validated later).
+normalize_region() {
+    local r="${1,,}"
+    echo "${REGION_ALIASES[$r]:-$r}"
+}
 
 # Scrape <region>.<network>.bam.jito.wtf hostnames from the page and echo a
 # space-separated, de-duplicated region list. Empty echo on any failure.
@@ -103,6 +125,11 @@ TARGET_HOST=""
 if [[ -n "$REGION" ]] && is_direct_host "$REGION"; then
     TARGET_HOST="$REGION"
     REGION=""
+fi
+
+# Accept a legacy city name (or any case) as well as the IATA code.
+if [[ -n "$REGION" ]]; then
+    REGION=$(normalize_region "$REGION")
 fi
 
 # ── Auto-detect network if not specified on command line ─────────────
@@ -542,6 +569,9 @@ BAM_DETECT_SOURCE="${_BAM_RESULT#*|}"
 CURRENT_BAM_REGION=""
 if [[ -n "$CURRENT_BAM_URL" ]]; then
     CURRENT_BAM_REGION=$(extract_region_from_url "$CURRENT_BAM_URL")
+    # A still-running validator may report a legacy city-name URL; fold it
+    # to the IATA code so the current-connection "*" marker matches the list.
+    CURRENT_BAM_REGION=$(normalize_region "$CURRENT_BAM_REGION")
 fi
 
 # ── Show current BAM connection ──────────────────────────────────────
