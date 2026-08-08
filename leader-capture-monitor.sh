@@ -1,13 +1,29 @@
 #!/usr/bin/env bash
 set -u
 
-# Skip unless the running validator is using the staked identity.
-/home/sol/bam-leader-activity/role-gate.sh || exit 0
-
 # Redirect all output to log file (avoids systemd StandardOutput=append: FD
 # inheritance issues that cause bash wait/pipefail to deadlock in subshells)
 LOG_FILE="${HOME}/logs/leader-capture-monitor.log"
 exec >> "$LOG_FILE" 2>&1
+
+# Wait for the staked identity rather than exiting.
+# role-gate.sh: 0 = staked/active, 1 = standby, 2 = error (validator still
+# starting, admin RPC unreachable, ...). The previous
+#     role-gate.sh || exit 0
+# treated BOTH 1 and 2 as "quit", and this unit is Restart=always with
+# RestartSec=10 -- so every standby host, and every validator startup, became a
+# restart every 10s forever: ~8,205 restarts on ogden on 2026-07-28, and 199 in
+# the 34 minutes between boot and promotion on 2026-08-05. It never latched
+# FAILED (a 10s cycle is slower than the 2s needed to trip systemd's 10s/5
+# burst limit), so no alert ever fired and `systemctl is-active` read healthy.
+# Blocking here keeps exactly ONE idle process and starts work on promotion.
+if ! /home/sol/bam-leader-activity/role-gate.sh >/dev/null 2>&1; then
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Not the staked identity - waiting for promotion (recheck every 60s)"
+    while ! /home/sol/bam-leader-activity/role-gate.sh >/dev/null 2>&1; do
+        sleep 60
+    done
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Staked identity acquired - starting capture"
+fi
 
 ###############################################################################
 # Leader Slot Capture Monitor
@@ -641,7 +657,20 @@ if $ONCE; then
     run_capture_cycle
     log "Single capture cycle complete."
 else
+    _last_role_check=$SECONDS
     while true; do
+        # The gate used to be evaluated only at startup, so a demoted host kept
+        # capturing indefinitely: on 2026-08-08 ogden was still running this
+        # while new-amsterdam held the staked identity. Re-check periodically and
+        # exit cleanly on demotion -- systemd restarts us and the wait loop above
+        # parks the process until this host is promoted again.
+        if (( SECONDS - _last_role_check >= 300 )); then
+            _last_role_check=$SECONDS
+            if ! /home/sol/bam-leader-activity/role-gate.sh >/dev/null 2>&1; then
+                log "Lost the staked identity - exiting; will wait for promotion."
+                exit 0
+            fi
+        fi
         if run_capture_cycle; then
             log "Capture cycle complete. Checking for next window..."
         else
