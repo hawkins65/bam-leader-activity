@@ -252,7 +252,18 @@ def deduplicate_errors(errors):
 
 
 def extract_bam_summary(cutoff_time, verbose=False):
-    """Extract BAM connectivity and metrics from validator.log for the time window."""
+    """Extract BAM connectivity and metrics from validator.log for the time window.
+
+    NOTE: Overlaps bam-leader-activity.py, deliberately and only partially.
+    Both sum the same `datapoint: bam_` metric keys, so a change to those keys
+    must be made in BOTH places. Everything else here is unique to this script --
+    BAM_ERROR_PATTERNS categorisation, auth-failure detection, and leader-slot
+    detection from `bam_scheduler` "Bank boundary detected" lines -- and
+    bam-leader-activity.py produces none of it. Replacing this with a call to
+    that script (considered 2026-08-09) would therefore LOSE the error
+    categorisation this hourly summary exists to provide. Do not "deduplicate"
+    it without first porting those three behaviours across.
+    """
     if not VALIDATOR_LOG.exists():
         return None
 

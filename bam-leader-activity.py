@@ -11,9 +11,12 @@ Supports reading from a log file or from journalctl.
 import os
 import re
 import sys
+import io
+import json
+import contextlib
 import subprocess
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 
 # =============================================================================
 # CONFIGURATION - Set your defaults here
@@ -52,6 +55,9 @@ Usage:
   {sys.argv[0]} -j [service]         Read from journalctl (default: {DEFAULT_SERVICE}, last {DEFAULT_HOURS}h)
   {sys.argv[0]} --journal [service]  Read from journalctl (default: {DEFAULT_SERVICE}, last {DEFAULT_HOURS}h)
   {sys.argv[0]} --hours N            Set time span for journalctl (default: {DEFAULT_HOURS})
+  {sys.argv[0]} --since EPOCH        Only analyse lines at/after this UTC epoch-second
+  {sys.argv[0]} --until EPOCH        Only analyse lines at/before this UTC epoch-second
+  {sys.argv[0]} --json               Emit a machine-readable summary instead of tables
 
 Examples:
   {sys.argv[0]}                      # Use default log file
@@ -62,10 +68,46 @@ Examples:
   {sys.argv[0]} -j sol --hours 12    # Use journalctl for sol.service, last 12 hours
 """)
 
-def get_lines_from_file(log_file):
-    """Generator that yields lines from a log file"""
+def _seek_to_window(fh, size, since_dt):
+    """Position fh so that everything from since_dt onwards is still ahead of it.
+
+    validator.log is ~500MB and the per-rotation window is the last few minutes,
+    so reading from byte 0 would mean ~16GB/day of pointless I/O on a staked
+    validator (and would evict its page cache). Instead seek near the end and walk
+    backwards in growing chunks until the first timestamp we can parse is at or
+    before the window start -- that guarantees the window is fully covered.
+    Falls back to the whole file if we can't establish that.
+    """
+    chunk = 8 * 1024 * 1024
+    while chunk < size:
+        fh.seek(size - chunk)
+        fh.readline()          # discard the partial line we landed in
+        pos = fh.tell()
+        for _ in range(200):   # find the first line here we can date
+            line = fh.readline()
+            if not line:
+                break
+            dt, minute_key = parse_timestamp(line)
+            if minute_key:
+                if dt <= since_dt:
+                    fh.seek(pos)
+                    return
+                break          # started too late - go further back
+        chunk *= 4
+    fh.seek(0)
+
+
+def get_lines_from_file(log_file, since_dt=None):
+    """Generator that yields lines from a log file, tail-seeking when windowed."""
     try:
         with open(log_file, 'r', errors='replace') as f:
+            if since_dt is not None:
+                try:
+                    size = os.path.getsize(log_file)
+                    if size > 8 * 1024 * 1024:
+                        _seek_to_window(f, size, since_dt)
+                except OSError:
+                    pass       # any trouble: just read the whole thing
             for line in f:
                 yield line
     except FileNotFoundError:
@@ -75,14 +117,28 @@ def get_lines_from_file(log_file):
         print(f"Error: Permission denied: {log_file}")
         sys.exit(1)
 
-def get_lines_from_journalctl(service, hours=None):
-    """Generator that yields lines from journalctl for a service"""
+def get_lines_from_journalctl(service, hours=None, since_dt=None, until_dt=None):
+    """Generator that yields lines from journalctl for a service.
+
+    When a window is given it is pushed down into journalctl rather than being
+    filtered in Python: this is called once per leader rotation on a validator
+    whose journal is large, and reading it all only to discard 99% of it is real
+    I/O on a staked host.
+
+    The `@<epoch>` form is used deliberately -- journalctl interprets a bare
+    "YYYY-MM-DD HH:MM:SS" in LOCAL time, which would silently shift the window on
+    any host that is not UTC, whereas @epoch is unambiguous.
+    """
     if not service.endswith('.service'):
         service = f"{service}.service"
 
     cmd = ['journalctl', '-u', service, '--no-pager', '-o', 'cat']
-    if hours is not None:
+    if since_dt is not None:
+        cmd.extend(['--since', f'@{int(since_dt.replace(tzinfo=timezone.utc).timestamp())}'])
+    elif hours is not None:
         cmd.extend(['--since', f'{hours} hours ago'])
+    if until_dt is not None:
+        cmd.extend(['--until', f'@{int(until_dt.replace(tzinfo=timezone.utc).timestamp())}'])
 
     try:
         process = subprocess.Popen(
@@ -118,8 +174,13 @@ def format_lamports(lamports):
     else:
         return f"{sol:.9f}"
 
-def analyze_logs(line_source, source_name):
-    """Analyze log lines and produce the report"""
+def analyze_logs(line_source, source_name, since_dt=None, until_dt=None):
+    """Analyze log lines and produce the report.
+
+    since_dt/until_dt bound the analysis to a UTC window (naive datetimes, to
+    match the naive timestamps parsed out of the log). Returns a summary dict
+    for --json consumers; the human-readable tables are still printed as before.
+    """
 
     print(f"Analyzing: {source_name}")
     print("Processing logs", end="", flush=True)
@@ -177,8 +238,17 @@ def analyze_logs(line_source, source_name):
         line_count += 1
         if line_count % progress_interval == 0:
             print(".", end="", flush=True)
-        _, minute_key = parse_timestamp(line)
+        dt, minute_key = parse_timestamp(line)
         if not minute_key:
+            continue
+
+        # Bound the analysis to an explicit window when asked.
+        # leader-capture-monitor.sh calls this once per leader rotation (~30x/day);
+        # without a window every call would re-scan the whole log and re-report
+        # every previous rotation's data.
+        if since_dt is not None and dt < since_dt:
+            continue
+        if until_dt is not None and dt > until_dt:
             continue
 
         # Check for BAM metrics
@@ -617,6 +687,48 @@ def analyze_logs(line_source, source_name):
             print(f"  Per-block median: {format_lamports(median_total_fee)} SOL fees, {format_lamports(median_priority_fee)} SOL priority")
             print(f"  Median block time: {median_time_ms:.1f} ms")
 
+    # ---- structured summary for --json consumers ----------------------------
+    # Built from the same values the tables above print, so the two can never
+    # disagree. The BAM totals are initialised unconditionally further up; the
+    # leader-slot locals only exist when leader metrics were seen in the window,
+    # hence the _have_leader guard (a conditional expression short-circuits, so
+    # the names are never evaluated when absent).
+    _have_leader = bool(leader_slot_metrics or leader_slots_announced)
+    return {
+        "source": source_name,
+        "window": {
+            "since": since_dt.strftime("%Y-%m-%dT%H:%M:%SZ") if since_dt else None,
+            "until": until_dt.strftime("%Y-%m-%dT%H:%M:%SZ") if until_dt else None,
+            "first_active_minute": active_minutes[0] if active_minutes else None,
+            "last_active_minute": active_minutes[-1] if active_minutes else None,
+            "active_minutes": len(active_minutes),
+        },
+        "bam": {
+            "bundles_received": total_bundles,
+            "results_sent": total_results,
+            # None, not 0: "no bundles arrived" and "0% of bundles were sent on"
+            # are different failures and must stay distinguishable downstream.
+            "send_rate_pct": round((total_results / total_bundles) * 100, 2) if total_bundles else None,
+            "scheduler_fail": total_scheduler_fail,
+            "outbound_fail": total_outbound_fail,
+            "failures_total": total_scheduler_fail + total_outbound_fail,
+            "heartbeats_leader_periods": total_heartbeats,
+            "heartbeats_total": global_heartbeats,
+            "unhealthy_connection_events": global_unhealthy,
+        },
+        "leader_slots": {
+            "produced": slot_count if _have_leader else 0,
+            "skipped": skipped_count if _have_leader else 0,
+            "small_blocks": small_block_count if _have_leader else 0,
+            "transactions": total_txns if _have_leader else 0,
+            "votes": total_votes if _have_leader else 0,
+            "user_transactions": total_user if _have_leader else 0,
+            "compute_units": total_block_cost if _have_leader else 0,
+            "total_fee_lamports": total_total_fee if _have_leader else 0,
+            "priority_fee_lamports": total_priority_fee if _have_leader else 0,
+        },
+    }
+
 def verify_log_file(log_file):
     """Check if log file exists and is readable"""
     if not os.path.exists(log_file):
@@ -657,9 +769,54 @@ def verify_journalctl_service(service):
         print(f"Run '{sys.argv[0]} --help' for usage information.")
         sys.exit(1)
 
+def _parse_window_arg(args, flag):
+    """Pull `--since/--until <epoch-seconds>` out of args. Returns (args, dt|None).
+
+    Epoch seconds, not a date string, because the caller is
+    leader-capture-monitor.sh, which already has the rotation window as epoch
+    seconds. Converted to a NAIVE UTC datetime to match parse_timestamp(), which
+    parses the log's naive UTC timestamps.
+    """
+    if flag not in args:
+        return args, None
+    try:
+        idx = args.index(flag)
+        value = int(args[idx + 1])
+        args = args[:idx] + args[idx + 2:]
+        return args, datetime.fromtimestamp(value, tz=timezone.utc).replace(tzinfo=None)
+    except (IndexError, ValueError):
+        print(f"Error: {flag} requires epoch seconds (integer)")
+        print(f"Run '{sys.argv[0]} --help' for usage information.")
+        sys.exit(1)
+
+
+def _run(line_source, source_name, since_dt, until_dt, json_mode):
+    """Run the analysis, emitting either the tables or a JSON summary.
+
+    In JSON mode the table output is captured and discarded rather than the
+    ~500 lines of print() being made conditional -- that keeps the human output
+    and the machine output driven by exactly the same code path.
+    """
+    if not json_mode:
+        return analyze_logs(line_source, source_name, since_dt, until_dt)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        summary = analyze_logs(line_source, source_name, since_dt, until_dt)
+    print(json.dumps(summary, indent=2))
+    return summary
+
+
 def main():
     # Parse arguments
     args = sys.argv[1:]
+
+    json_mode = '--json' in args
+    if json_mode:
+        args = [a for a in args if a != '--json']
+
+    args, since_dt = _parse_window_arg(args, '--since')
+    args, until_dt = _parse_window_arg(args, '--until')
 
     # Extract --hours if present
     hours = DEFAULT_HOURS
@@ -681,7 +838,7 @@ def main():
             print(f"Run '{sys.argv[0]} --help' for usage information.")
             sys.exit(1)
         verify_log_file(DEFAULT_LOG_PATH)
-        analyze_logs(get_lines_from_file(DEFAULT_LOG_PATH), DEFAULT_LOG_PATH)
+        _run(get_lines_from_file(DEFAULT_LOG_PATH, since_dt), DEFAULT_LOG_PATH, since_dt, until_dt, json_mode)
 
     elif args[0] in ['-h', '--help']:
         print_usage()
@@ -693,13 +850,18 @@ def main():
         display_name = service if service.endswith('.service') else f"{service}.service"
 
         verify_journalctl_service(service)
-        analyze_logs(get_lines_from_journalctl(service, hours), f"journalctl -u {display_name} (last {hours}h)")
+        if since_dt or until_dt:
+            label = f"journalctl -u {display_name} ({since_dt or 'start'} .. {until_dt or 'now'} UTC)"
+        else:
+            label = f"journalctl -u {display_name} (last {hours}h)"
+        _run(get_lines_from_journalctl(service, hours, since_dt, until_dt), label,
+             since_dt, until_dt, json_mode)
 
     else:
         # Assume it's a log file path
         log_file = args[0]
         verify_log_file(log_file)
-        analyze_logs(get_lines_from_file(log_file), log_file)
+        _run(get_lines_from_file(log_file, since_dt), log_file, since_dt, until_dt, json_mode)
 
 if __name__ == "__main__":
     main()

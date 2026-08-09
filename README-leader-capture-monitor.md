@@ -1,15 +1,32 @@
 # Leader Capture Monitor
 
-Automatically captures bundle transaction DEBUG logs around leader slots. The monitor watches the leader schedule, enables `bundle_stage` debug logging before each leader rotation, and extracts bundle transaction signatures after the rotation completes.
+Reports on-chain activity for each of this validator's leader rotations, plus the
+health of the BAM connection during them. The monitor watches the leader schedule,
+waits for each rotation to finalise, extracts the block data via RPC, and posts a
+combined summary to Discord.
+
+> **This monitor does NOT enable debug logging.** It used to: the original design
+> toggled `solana_core::bundle_stage=debug` around every rotation and parsed the
+> resulting logs. Commit `75c2627` replaced that with RPC extraction, because BAM
+> bundles never traverse `BundleStage` and therefore produce no such logs at all
+> (see `bam-scheduler-debug-log-patch.md`). It no longer touches validator log
+> levels, so its runtime cost to the validator is only the RPC reads.
+> This file previously still described the old design, which misled readers into
+> believing debug capture was happening. Corrected 2026-08-09.
 
 ## How It Works
 
 1. **Poll** — Queries the leader schedule via RPC to find upcoming leader slots for your validator
 2. **Merge** — Groups nearby leader rotations into a single capture window (avoids toggling debug logging on/off rapidly when rotations are close together)
 3. **Wait** — Sleeps with adaptive polling, re-checking slot timing frequently to handle drift
-4. **Capture** — Enables `solana_core::bundle_stage=debug` logging ~60s before the first slot
-5. **Extract** — After the last slot + post-buffer, restores default logging and runs `bundle-txn-signatures.py` to extract signatures
-6. **Report** — Sends a summary to Discord and saves results to `captures/`
+4. **Settle** — Waits `BUFFER_AFTER_SECONDS` past the last slot so the blocks are finalised
+5. **Extract** — Runs `slot-transactions.py` (RPC `getBlock`) over our leader slots for
+   revenue/tx data, and `bam-leader-activity.py --since/--until --json` over the same
+   window for BAM telemetry (bundles received/sent, scheduler and outbound failures,
+   heartbeats, unhealthy connection events)
+6. **Report** — Posts ONE combined Discord embed (revenue + BAM health, escalating to a
+   warning when BAM looks degraded) and writes `captures/slot_txns_*.{txt,json}` plus
+   `captures/bam_activity_*.json`
 
 This avoids running DEBUG logging 24/7 (which bloats logs significantly) while still capturing every bundle transaction during your leader slots.
 

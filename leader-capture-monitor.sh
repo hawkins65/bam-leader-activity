@@ -99,6 +99,13 @@ WAIT_PROGRESS_INTERVAL=300  # Emit a progress log every N sec in the completion-
 
 # RPC-based extraction (BAM bundles don't produce debug logs)
 SLOT_TRANSACTIONS_SCRIPT="$SCRIPT_DIR/slot-transactions.py"
+# BAM telemetry for the same window. slot-transactions.py is pure getBlock: it
+# reports WHAT landed but nothing about whether BAM itself was healthy while we
+# were leader, so a low-tip rotation is ambiguous - degraded BAM and a quiet
+# market look identical. bam-leader-activity.py reads bam_connection-metrics,
+# which is info-level and always emitted (NOT the dead bundle_stage debug path).
+BAM_ACTIVITY_SCRIPT="$SCRIPT_DIR/bam-leader-activity.py"
+BAM_MIN_SEND_RATE=95          # alert below this % of bundles forwarded
 
 # Discord
 DISCORD_WEBHOOK="$(cat "$HOME/.config/discord/webhook" 2>/dev/null | tr -d '[:space:]')"
@@ -378,6 +385,46 @@ print(
     withdrawal_sol="${withdrawal_sol:-0}"
     total_compute_units="${total_compute_units:-0}"
 
+    # ── BAM telemetry for exactly this rotation window ───────────────────────
+    # Windowed on purpose: without --since/--until this would re-scan the whole
+    # ~500MB validator.log every rotation (~30x/day) and re-report every prior
+    # rotation's bundles.
+    local bam_json_file="$OUTPUT_DIR/bam_activity_${timestamp}.json"
+    local bam_line=""
+    if [[ -x "$BAM_ACTIVITY_SCRIPT" ]]; then
+        if "$BAM_ACTIVITY_SCRIPT" --since "$capture_start_time" \
+                --until "$capture_end_time" --json > "$bam_json_file" 2>/dev/null; then
+            bam_line=$(python3 -c "
+import json
+d = json.load(open('$bam_json_file'))['bam']
+rate = d.get('send_rate_pct')
+print(
+    d.get('bundles_received', 0),
+    d.get('results_sent', 0),
+    'na' if rate is None else f'{rate:.1f}',
+    d.get('scheduler_fail', 0),
+    d.get('outbound_fail', 0),
+    d.get('heartbeats_total', 0),
+    d.get('unhealthy_connection_events', 0),
+)
+" 2>/dev/null)
+        else
+            log "WARNING: bam-leader-activity.py failed for this window"
+        fi
+    fi
+
+    local bam_bundles bam_sent bam_rate bam_sched_fail bam_out_fail
+    local bam_heartbeats bam_unhealthy
+    read -r bam_bundles bam_sent bam_rate bam_sched_fail bam_out_fail \
+            bam_heartbeats bam_unhealthy <<< "$bam_line"
+    bam_bundles="${bam_bundles:-0}"
+    bam_sent="${bam_sent:-0}"
+    bam_rate="${bam_rate:-na}"
+    bam_sched_fail="${bam_sched_fail:-0}"
+    bam_out_fail="${bam_out_fail:-0}"
+    bam_heartbeats="${bam_heartbeats:-0}"
+    bam_unhealthy="${bam_unhealthy:-0}"
+
     local capture_duration=$(( capture_end_time - capture_start_time ))
     local slot_range="${first_slot}–${last_slot}"
     # Count of OUR leader slots in the window (not the range span, which
@@ -449,6 +496,34 @@ print(
     if (( withdrawal_count > 0 )); then
         desc+=$'\n'"⚠️ **Tip account withdrawals:** ${withdrawal_count} event(s), ${withdrawal_sol} SOL out — see ${text_file}"
     fi
+    # BAM health for this window - this is what makes the revenue figure above
+    # diagnosable rather than just observed.
+    desc+=$'\n'"**BAM:** ${bam_bundles} bundles → ${bam_sent} sent (${bam_rate}%), ${bam_heartbeats} heartbeats"
+    if (( bam_sched_fail > 0 || bam_out_fail > 0 )); then
+        desc+=$'\n'"⚠️ **BAM failures:** ${bam_sched_fail} scheduler, ${bam_out_fail} outbound"
+    fi
+    if (( bam_unhealthy > 0 )); then
+        desc+=$'\n'"⚠️ **BAM unhealthy connection events:** ${bam_unhealthy}"
+    fi
+
+    # ── Exception alerting (threshold, not schedule) ─────────────────────────
+    # Evaluated PER ROTATION on purpose: zero bundles outside a leader window is
+    # normal (bundles only arrive while we lead), so "0 bundles" is only
+    # meaningful when set against slots we actually produced.
+    local bam_alert=""
+    if (( produced_slots > 0 && bam_bundles == 0 )); then
+        bam_alert="BAM delivered 0 bundles across ${produced_slots} produced slot(s)"
+    elif [[ "$bam_rate" != "na" ]] && (( $(echo "$bam_rate < $BAM_MIN_SEND_RATE" | bc -l) )); then
+        bam_alert="BAM send rate ${bam_rate}% is below ${BAM_MIN_SEND_RATE}%"
+    elif (( bam_unhealthy > 0 )); then
+        bam_alert="${bam_unhealthy} unhealthy BAM connection event(s)"
+    fi
+    if [[ -n "$bam_alert" ]]; then
+        severity="warning"
+        desc+=$'\n'"🚨 **BAM ALERT:** ${bam_alert}"
+        log "BAM ALERT: $bam_alert"
+    fi
+
     desc+=$'\n'"**Output:** ${text_file}"
 
     local title="Leader Slot Report"
@@ -456,6 +531,9 @@ print(
         title="Leader Slot Report — No Transactions"
     elif (( withdrawal_count > 0 )); then
         title="Leader Slot Report — ⚠️ Tip Withdrawal Detected"
+    fi
+    if [[ -n "$bam_alert" ]]; then
+        title="${title} — 🚨 BAM"
     fi
 
     send_discord "$title" "$desc" "$severity"
@@ -473,6 +551,10 @@ print(
     log "  Total to Validator: $total_to_validator SOL"
     if (( withdrawal_count > 0 )); then
         log "  ⚠️  Tip withdrawals: $withdrawal_count event(s), $withdrawal_sol SOL out"
+    fi
+    log "  BAM: $bam_bundles bundles, $bam_sent sent (${bam_rate}%), $bam_heartbeats heartbeats, $bam_unhealthy unhealthy"
+    if [[ -n "$bam_alert" ]]; then
+        log "  BAM ALERT: $bam_alert"
     fi
     log "  Output: $text_file"
 }

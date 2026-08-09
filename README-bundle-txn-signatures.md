@@ -1,5 +1,19 @@
 # Bundle Transaction Signature Extractor
 
+> **⚠️ NON-FUNCTIONAL ON A BAM VALIDATOR.** This tool, and `capture-bundle-txns.sh`
+> which drives it, depend on `solana_core::bundle_stage=debug` output. BAM bundles
+> flow `BankingStage` → `BamScheduler` → `ConsumeWorker` and never reach
+> `BundleStage`, so that log line is never emitted and setting the log filter does
+> nothing (see `bam-scheduler-debug-log-patch.md`). They produce empty results here.
+>
+> The live path is `slot-transactions.py` (RPC `getBlock`, revenue and transactions)
+> plus `bam-leader-activity.py` (BAM bundle/connection telemetry from
+> `bam_connection-metrics`, which is info-level and always emitted). Both are driven
+> automatically by `leader-capture-monitor.sh` each rotation.
+>
+> Retained only for non-BAM validators, or if the `bam_scheduler.rs` debug patch in
+> `bam-scheduler-debug-log-patch.md` is ever built and deployed. Noted 2026-08-09.
+
 Extract transaction signatures from Jito-Solana bundle execution logs. This tool parses DEBUG-level logs to show which transactions were included in bundles during validator leader slots.
 
 ## Prerequisites
