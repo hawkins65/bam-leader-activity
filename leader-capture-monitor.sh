@@ -498,6 +498,23 @@ print(
     fi
     # BAM health for this window - this is what makes the revenue figure above
     # diagnosable rather than just observed.
+    #
+    # Everything BAM-related below is gated on there being BAM telemetry at all.
+    # Heartbeats flow continuously whenever a BAM connection exists, independent
+    # of whether we are leader, so "no heartbeats" means this validator is not
+    # running BAM rather than that BAM is broken. Without this gate a non-BAM
+    # validator (e.g. testnet) would fire the zero-bundles alert on every single
+    # rotation.
+    # Declared before the bam_present gate on purpose: it is read further down
+    # in the title and the log summary, both OUTSIDE the gate, and set -u would
+    # abort the entire rotation report on a validator with no BAM telemetry.
+    local bam_alert=""
+    local bam_present=0
+    if (( bam_heartbeats > 0 || bam_bundles > 0 )); then
+        bam_present=1
+    fi
+
+    if (( bam_present == 1 )); then
     desc+=$'\n'"**BAM:** ${bam_bundles} bundles → ${bam_sent} sent (${bam_rate}%), ${bam_heartbeats} heartbeats"
     if (( bam_sched_fail > 0 || bam_out_fail > 0 )); then
         desc+=$'\n'"⚠️ **BAM failures:** ${bam_sched_fail} scheduler, ${bam_out_fail} outbound"
@@ -510,8 +527,9 @@ print(
     # Evaluated PER ROTATION on purpose: zero bundles outside a leader window is
     # normal (bundles only arrive while we lead), so "0 bundles" is only
     # meaningful when set against slots we actually produced.
-    local bam_alert=""
-    if (( produced_slots > 0 && bam_bundles == 0 )); then
+    if (( bam_present == 0 )); then
+        : # no BAM on this validator - nothing to assert about it
+    elif (( produced_slots > 0 && bam_bundles == 0 )); then
         bam_alert="BAM delivered 0 bundles across ${produced_slots} produced slot(s)"
     elif [[ "$bam_rate" != "na" ]] && (( $(echo "$bam_rate < $BAM_MIN_SEND_RATE" | bc -l) )); then
         bam_alert="BAM send rate ${bam_rate}% is below ${BAM_MIN_SEND_RATE}%"
@@ -523,6 +541,7 @@ print(
         desc+=$'\n'"🚨 **BAM ALERT:** ${bam_alert}"
         log "BAM ALERT: $bam_alert"
     fi
+    fi   # bam_present
 
     desc+=$'\n'"**Output:** ${text_file}"
 
