@@ -82,10 +82,6 @@ case "$NETWORK" in
 esac
 VALIDATOR_IDENTITY="${VALIDATOR_IDENTITY:?VALIDATOR_IDENTITY not set in $VALIDATOR_CONFIG}"
 
-# Read commission from validator.sh (--commission-bps value, in basis points)
-COMMISSION_BPS=$(grep -oP '(?<=--commission-bps )\d+' "$HOME/validator.sh" 2>/dev/null || echo "0")
-COMMISSION_PCT=$(echo "scale=4; $COMMISSION_BPS / 100" | bc -l)
-
 # Timing configuration
 BUFFER_AFTER_SECONDS=60     # Wait this long after last slot before querying RPC
 MERGE_GAP_SECONDS=180       # Merge groups closer than this (3 minutes)
@@ -149,6 +145,25 @@ done
 
 log() { echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] $*"; }
 debug() { $VERBOSE && log "DEBUG: $*"; }
+
+# Read the MEV commission from validator.sh (--commission-bps, basis points).
+# This used to run once at process start, so a commission change was reported at
+# the stale rate until the unit was restarted -- testnet-ogden went 1000 -> 10000
+# bps on 2026-08-09 and kept printing "10.0000%" for hours. run_capture_cycle
+# calls this on every rotation, so an edit to validator.sh now takes effect on
+# the next report with no restart.
+refresh_commission() {
+    local bps pct
+    bps=$(grep -oP '(?<=--commission-bps )\d+' "$HOME/validator.sh" 2>/dev/null | head -1)
+    [[ "$bps" =~ ^[0-9]+$ ]] || bps=0
+    pct=$(echo "scale=4; $bps / 100" | bc -l)
+    if [[ -n "${COMMISSION_BPS:-}" && "$bps" != "$COMMISSION_BPS" ]]; then
+        log "Commission changed: ${COMMISSION_BPS} -> ${bps} bps (${COMMISSION_PCT}% -> ${pct}%)"
+    fi
+    COMMISSION_BPS=$bps
+    COMMISSION_PCT=$pct
+}
+refresh_commission
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -620,6 +635,8 @@ print(
 run_capture_cycle() {
     log "Checking leader schedule..."
 
+    refresh_commission
+
     local slot_duration
     slot_duration=$(get_slot_duration)
     debug "Slot duration: ${slot_duration}s"
@@ -790,6 +807,7 @@ log "  RPC: ${RPC_URL%%://*}://***${RPC_URL##*/}"
 log "  Post-slot buffer: ${BUFFER_AFTER_SECONDS}s (wait for block finalization)"
 log "  Merge gap: ${MERGE_GAP_SECONDS}s (groups closer than this are merged)"
 log "  Dry-run: $DRY_RUN"
+log "  MEV commission: ${COMMISSION_PCT}% (${COMMISSION_BPS} bps, from validator.sh)"
 
 if $ONCE; then
     run_capture_cycle
