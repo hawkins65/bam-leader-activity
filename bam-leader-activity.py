@@ -16,7 +16,7 @@ import json
 import contextlib
 import subprocess
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # =============================================================================
 # CONFIGURATION - Set your defaults here
@@ -31,6 +31,15 @@ VOTE_CU_COST = 3428
 # Table separator widths (based on column formats)
 BAM_TABLE_WIDTH = 91
 LEADER_TABLE_WIDTH = 126
+
+# Seconds of slack around the leader period when --leader-slots anchors the BAM
+# sub-window. BAM streams bundles a beat ahead of the first leader slot and the
+# bundleresult_sent datapoints trail bundle_received by a few hundred ms, so a
+# tight window would undercount bundles at the head and depress send_rate_pct at
+# the tail. Bundles are 0 outside leader periods, so slack costs nothing.
+# parse_timestamp() resolves to whole seconds, hence seconds, not milliseconds.
+LEADER_WINDOW_PRE_ROLL_S = 5
+LEADER_WINDOW_POST_ROLL_S = 5
 # =============================================================================
 
 def parse_timestamp(line):
@@ -58,6 +67,11 @@ Usage:
   {sys.argv[0]} --since EPOCH        Only analyse lines at/after this UTC epoch-second
   {sys.argv[0]} --until EPOCH        Only analyse lines at/before this UTC epoch-second
   {sys.argv[0]} --json               Emit a machine-readable summary instead of tables
+  {sys.argv[0]} --leader-slots CSV   Our slot numbers for this rotation. Ignores other
+                                     validators' leader lines, and counts bundles over a
+                                     window anchored on where those slots appear in the
+                                     log rather than over --since/--until. Pass a
+                                     generous --since with it.
 
 Examples:
   {sys.argv[0]}                      # Use default log file
@@ -174,12 +188,28 @@ def format_lamports(lamports):
     else:
         return f"{sol:.9f}"
 
-def analyze_logs(line_source, source_name, since_dt=None, until_dt=None):
+def analyze_logs(line_source, source_name, since_dt=None, until_dt=None,
+                 leader_slot_filter=None):
     """Analyze log lines and produce the report.
 
     since_dt/until_dt bound the analysis to a UTC window (naive datetimes, to
     match the naive timestamps parsed out of the log). Returns a summary dict
     for --json consumers; the human-readable tables are still printed as before.
+
+    leader_slot_filter is a set of slot numbers owned by the caller's rotation.
+    When given it does two things:
+
+      1. Leader-slot lines for any OTHER validator's slots are ignored, so the
+         caller can pass a deliberately generous since/until without a
+         neighbouring rotation polluting the leader-slot section.
+      2. BAM bundle counts are re-derived over a sub-window anchored on where
+         those slots actually appear in the log, instead of the caller's
+         wall-clock window. leader-capture-monitor.sh stamps its window when an
+         RPC poll first observes current_slot >= first_slot, which lags the real
+         leader period by poll granularity + RPC lag; a rotation is only ~1.6s
+         long, so that window routinely started AFTER the entire bundle burst
+         and reported 0 bundles for a perfectly healthy BAM (8 of 15 rotations
+         on 2026-08-09). Anchoring on the log removes the guesswork.
     """
 
     print(f"Analyzing: {source_name}")
@@ -202,8 +232,20 @@ def analyze_logs(line_source, source_name, since_dt=None, until_dt=None):
     leader_slot_metrics = {}  # slot -> metrics dict
 
     # Global health tracking (across all time, not just active periods)
+    # Deliberately NOT narrowed by leader_slot_filter: heartbeats and unhealthy
+    # events are the liveness signal for the BAM connection itself, which the
+    # caller uses to decide whether this validator runs BAM at all. They must
+    # describe the whole window, not the ~10s leader sub-window.
     global_heartbeats = 0
     global_unhealthy = 0
+
+    # (dt, bundles, results, scheduler_fail, outbound_fail) per BAM datapoint,
+    # buffered only when we will need to re-window them. The sub-window is not
+    # known until the leader lines have been seen, so this cannot be a one-pass
+    # accumulation. The caller's outer window is a few minutes of log at most.
+    bam_points = []
+    # dt of every replay_stage-my_leader_slot line for a slot we own.
+    leader_slot_times = []
 
     # Regex patterns for BAM metrics
     bundle_rx = re.compile(r'bundle_received=(\d+)i')
@@ -260,6 +302,15 @@ def analyze_logs(line_source, source_name, since_dt=None, until_dt=None):
             unhealthy_match = unhealthy_rx.search(line)
             heartbeat_match = heartbeat_rx.search(line)
 
+            if leader_slot_filter is not None:
+                bam_points.append((
+                    dt,
+                    int(bundle_match.group(1)) if bundle_match else 0,
+                    int(results_match.group(1)) if results_match else 0,
+                    int(scheduler_fail_match.group(1)) if scheduler_fail_match else 0,
+                    int(outbound_fail_match.group(1)) if outbound_fail_match else 0,
+                ))
+
             if bundle_match:
                 bundles = int(bundle_match.group(1))
                 bundle_data[minute_key]["bundles"] += bundles
@@ -299,13 +350,18 @@ def analyze_logs(line_source, source_name, since_dt=None, until_dt=None):
             match = my_leader_slot_rx.search(line)
             if match:
                 slot = int(match.group(1))
+                if leader_slot_filter is not None and slot not in leader_slot_filter:
+                    continue
                 leader_slots_announced.add(slot)
+                leader_slot_times.append(dt)
 
         # Check for cost tracker stats (leader slots)
         elif 'cost_tracker_stats,is_leader=true' in line:
             match = cost_tracker_rx.search(line)
             if match:
                 slot = int(match.group(1))
+                if leader_slot_filter is not None and slot not in leader_slot_filter:
+                    continue
                 if slot not in leader_slot_metrics:
                     leader_slot_metrics[slot] = {}
                 leader_slot_metrics[slot].update({
@@ -321,6 +377,8 @@ def analyze_logs(line_source, source_name, since_dt=None, until_dt=None):
             match = broadcast_rx.search(line)
             if match:
                 slot = int(match.group(1))
+                if leader_slot_filter is not None and slot not in leader_slot_filter:
+                    continue
                 broadcast_time = int(match.group(2))
                 if slot not in leader_slot_metrics:
                     leader_slot_metrics[slot] = {}
@@ -333,6 +391,8 @@ def analyze_logs(line_source, source_name, since_dt=None, until_dt=None):
                 receive_time = int(match.group(1))
                 schedule_time = int(match.group(2))
                 slot = int(match.group(3))
+                if leader_slot_filter is not None and slot not in leader_slot_filter:
+                    continue
                 if slot not in leader_slot_metrics:
                     leader_slot_metrics[slot] = {}
                 # Accumulate timing (there can be multiple entries per slot)
@@ -344,6 +404,35 @@ def analyze_logs(line_source, source_name, since_dt=None, until_dt=None):
     if line_count == 0:
         print("No log lines found.")
         sys.exit(1)
+
+    # ---- leader-anchored BAM sub-window -------------------------------------
+    # Only when the caller named its slots AND we found them in the log. If the
+    # slots are absent the log simply does not cover the leader period, which is
+    # an instrumentation gap, not a BAM outage -- report leader_window_found
+    # False and fall through to the plain window totals so the caller can
+    # downgrade its alert instead of paging on our own blind spot.
+    leader_window_found = False
+    anchored_window = None
+    anchored = None
+    if leader_slot_filter is not None and leader_slot_times:
+        sub_start = min(leader_slot_times) - timedelta(seconds=LEADER_WINDOW_PRE_ROLL_S)
+        sub_end = max(leader_slot_times) + timedelta(seconds=LEADER_WINDOW_POST_ROLL_S)
+        leader_window_found = True
+        anchored_window = (sub_start, sub_end)
+        anchored = {"bundles": 0, "results": 0, "scheduler_fail": 0, "outbound_fail": 0}
+        for pt_dt, pt_bundles, pt_results, pt_sched, pt_out in bam_points:
+            if pt_dt < sub_start or pt_dt > sub_end:
+                continue
+            anchored["bundles"] += pt_bundles
+            anchored["results"] += pt_results
+            anchored["scheduler_fail"] += pt_sched
+            anchored["outbound_fail"] += pt_out
+        print(f"Leader-anchored BAM window: {sub_start:%Y-%m-%dT%H:%M:%SZ}"
+              f" .. {sub_end:%Y-%m-%dT%H:%M:%SZ}"
+              f" ({anchored['bundles']:,} bundles, {anchored['results']:,} sent)\n")
+    elif leader_slot_filter is not None:
+        print("Leader-anchored BAM window: leader slots not found in this log "
+              "window -- BAM totals fall back to the requested window.\n")
 
     # Filter to only minutes with bundle activity (bundles > 0)
     active_minutes = sorted([m for m, d in bundle_data.items() if d["bundles"] > 0])
@@ -693,7 +782,17 @@ def analyze_logs(line_source, source_name, since_dt=None, until_dt=None):
     # leader-slot locals only exist when leader metrics were seen in the window,
     # hence the _have_leader guard (a conditional expression short-circuits, so
     # the names are never evaluated when absent).
+    #
+    # The one deliberate exception: with --leader-slots the bundle counters below
+    # come from the leader-anchored sub-window, which is narrower than the
+    # per-minute table above. That is the point of the flag, and the printed
+    # "Leader-anchored BAM window" line above states the same numbers.
     _have_leader = bool(leader_slot_metrics or leader_slots_announced)
+    if anchored is not None:
+        total_bundles = anchored["bundles"]
+        total_results = anchored["results"]
+        total_scheduler_fail = anchored["scheduler_fail"]
+        total_outbound_fail = anchored["outbound_fail"]
     return {
         "source": source_name,
         "window": {
@@ -702,6 +801,16 @@ def analyze_logs(line_source, source_name, since_dt=None, until_dt=None):
             "first_active_minute": active_minutes[0] if active_minutes else None,
             "last_active_minute": active_minutes[-1] if active_minutes else None,
             "active_minutes": len(active_minutes),
+        },
+        # The window the bundle counters below were actually taken over, and
+        # whether it was anchored on the leader slots or fell back to the
+        # caller's wall-clock window. A caller must not raise a "BAM delivered
+        # 0 bundles" alert when leader_window_found is false.
+        "bam_window": {
+            "leader_slots_requested": sorted(leader_slot_filter) if leader_slot_filter else None,
+            "leader_window_found": leader_window_found,
+            "since": anchored_window[0].strftime("%Y-%m-%dT%H:%M:%SZ") if anchored_window else None,
+            "until": anchored_window[1].strftime("%Y-%m-%dT%H:%M:%SZ") if anchored_window else None,
         },
         "bam": {
             "bundles_received": total_bundles,
@@ -790,7 +899,29 @@ def _parse_window_arg(args, flag):
         sys.exit(1)
 
 
-def _run(line_source, source_name, since_dt, until_dt, json_mode):
+def _parse_leader_slots_arg(args):
+    """Pull `--leader-slots N,M,...` out of args. Returns (args, set|None).
+
+    Same CSV that leader-capture-monitor.sh already passes to
+    slot-transactions.py, so the caller has it to hand.
+    """
+    if '--leader-slots' not in args:
+        return args, None
+    try:
+        idx = args.index('--leader-slots')
+        raw = args[idx + 1]
+        slots = {int(s) for s in raw.split(',') if s.strip()}
+        if not slots:
+            raise ValueError("empty slot list")
+        return args[:idx] + args[idx + 2:], slots
+    except (IndexError, ValueError):
+        print("Error: --leader-slots requires a comma-separated list of slot numbers")
+        print(f"Run '{sys.argv[0]} --help' for usage information.")
+        sys.exit(1)
+
+
+def _run(line_source, source_name, since_dt, until_dt, json_mode,
+         leader_slot_filter=None):
     """Run the analysis, emitting either the tables or a JSON summary.
 
     In JSON mode the table output is captured and discarded rather than the
@@ -798,11 +929,13 @@ def _run(line_source, source_name, since_dt, until_dt, json_mode):
     and the machine output driven by exactly the same code path.
     """
     if not json_mode:
-        return analyze_logs(line_source, source_name, since_dt, until_dt)
+        return analyze_logs(line_source, source_name, since_dt, until_dt,
+                            leader_slot_filter)
 
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        summary = analyze_logs(line_source, source_name, since_dt, until_dt)
+        summary = analyze_logs(line_source, source_name, since_dt, until_dt,
+                               leader_slot_filter)
     print(json.dumps(summary, indent=2))
     return summary
 
@@ -817,6 +950,7 @@ def main():
 
     args, since_dt = _parse_window_arg(args, '--since')
     args, until_dt = _parse_window_arg(args, '--until')
+    args, leader_slot_filter = _parse_leader_slots_arg(args)
 
     # Extract --hours if present
     hours = DEFAULT_HOURS
@@ -838,7 +972,8 @@ def main():
             print(f"Run '{sys.argv[0]} --help' for usage information.")
             sys.exit(1)
         verify_log_file(DEFAULT_LOG_PATH)
-        _run(get_lines_from_file(DEFAULT_LOG_PATH, since_dt), DEFAULT_LOG_PATH, since_dt, until_dt, json_mode)
+        _run(get_lines_from_file(DEFAULT_LOG_PATH, since_dt), DEFAULT_LOG_PATH, since_dt, until_dt, json_mode,
+             leader_slot_filter)
 
     elif args[0] in ['-h', '--help']:
         print_usage()
@@ -855,13 +990,14 @@ def main():
         else:
             label = f"journalctl -u {display_name} (last {hours}h)"
         _run(get_lines_from_journalctl(service, hours, since_dt, until_dt), label,
-             since_dt, until_dt, json_mode)
+             since_dt, until_dt, json_mode, leader_slot_filter)
 
     else:
         # Assume it's a log file path
         log_file = args[0]
         verify_log_file(log_file)
-        _run(get_lines_from_file(log_file, since_dt), log_file, since_dt, until_dt, json_mode)
+        _run(get_lines_from_file(log_file, since_dt), log_file, since_dt, until_dt, json_mode,
+             leader_slot_filter)
 
 if __name__ == "__main__":
     main()

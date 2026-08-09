@@ -101,12 +101,14 @@ def collect(pattern, prefix, since_ts, until_ts):
 def produced_skipped(txn):
     """Slots produced/skipped for a rotation, from slot-transactions.py.
 
-    Deliberately NOT taken from the BAM JSON: bam-leader-activity.py derives
-    leader slots from cost_tracker_stats/replay_stage lines, which frequently do
-    not appear inside a ~90s rotation window (observed 2026-08-09: 0 slots there
-    while slot-transactions.py saw 2,487 transactions). Using the BAM figure
-    would report zero slots for an entire epoch and silence the
-    produced-slots-but-no-bundles check entirely.
+    Deliberately NOT taken from the BAM JSON. bam-leader-activity.py derives
+    leader slots from cost_tracker_stats/replay_stage lines, and those were
+    frequently absent from the rotation window (observed 2026-08-09: 0 slots
+    there while slot-transactions.py saw 2,487 transactions) because the window
+    itself was misaligned -- see the --leader-slots fix. That is fixed at the
+    source now, but slot-transactions.py remains the better authority here: it
+    reads getBlock directly rather than inferring from log lines, so this stays
+    correct even if the log is rotated, truncated, or the window drifts again.
     """
     s = txn.get("summary", {}) if txn else {}
     total = s.get("total_slots", 0) or 0
@@ -157,6 +159,10 @@ def main():
 
     produced = skipped = 0
     dry_rotations = 0
+    # Rotations that look dry but whose window was never anchored to our leader
+    # slots. Reported as a note, never as an alert: this counts our own blind
+    # spots, not BAM's failures.
+    unanchored_dry = 0
     for stamp, bd in bam.items():
         p, s = produced_skipped(txns.get(stamp))
         produced += p
@@ -164,10 +170,20 @@ def main():
         # The failure that is invisible in revenue numbers alone: we led, and BAM
         # delivered nothing. Only counted where BAM is actually in use on this
         # host (heartbeats present), same reasoning as the per-rotation alert.
+        #
+        # And only where the rotation's bundle count was anchored on our leader
+        # slots. A zero from an unanchored capture describes the wrong seconds
+        # and is not evidence about BAM -- that is exactly the bug that made 8 of
+        # 15 rotations on 2026-08-09 look dry. Captures written before the fix
+        # carry no bam_window key at all, so they are excluded here rather than
+        # replaying the same false alert at digest time.
         got_bundles = bd.get("bam", {}).get("bundles_received", 0)
         has_bam = bd.get("bam", {}).get("heartbeats_total", 0) > 0 or got_bundles > 0
-        if has_bam and p > 0 and got_bundles == 0:
+        anchored = bd.get("bam_window", {}).get("leader_window_found", False)
+        if has_bam and anchored and p > 0 and got_bundles == 0:
             dry_rotations += 1
+        elif has_bam and not anchored and p > 0 and got_bundles == 0:
+            unanchored_dry += 1
 
     send_rate = (sent / bundles * 100) if bundles else None
 
@@ -187,6 +203,10 @@ def main():
     ]
     if dry_rotations:
         lines.append(f"🚨 **{dry_rotations} rotation(s) produced slots but received 0 bundles**")
+    if unanchored_dry:
+        lines.append(f"ℹ️ {unanchored_dry} rotation(s) show 0 bundles from an unanchored "
+                     "capture — window never covered our leader slots, so the count is "
+                     "not evidence about BAM. Bundle totals above are understated by the same amount.")
 
     desc = "\n".join(lines)
     severity = "warning" if (dry_rotations or unhealthy or

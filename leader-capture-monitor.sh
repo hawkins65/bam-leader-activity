@@ -106,6 +106,14 @@ SLOT_TRANSACTIONS_SCRIPT="$SCRIPT_DIR/slot-transactions.py"
 # which is info-level and always emitted (NOT the dead bundle_stage debug path).
 BAM_ACTIVITY_SCRIPT="$SCRIPT_DIR/bam-leader-activity.py"
 BAM_MIN_SEND_RATE=95          # alert below this % of bundles forwarded
+# How far BEFORE capture_start_time to let bam-leader-activity.py read. Our
+# window is stamped when an RPC poll first sees current_slot >= first_slot,
+# which trails the real leader period by poll granularity + RPC lag, while the
+# rotation itself is only ~1.6s long - so capture_start_time is routinely a few
+# seconds PAST the entire bundle burst. This is only a read bound: the script is
+# given --leader-slots and pins the actual counting window to where our slots
+# appear in the log, so widening this cannot pull in a neighbour's rotation.
+BAM_LOOKBACK_SECONDS=300
 
 # Discord
 DISCORD_WEBHOOK="$(cat "$HOME/.config/discord/webhook" 2>/dev/null | tr -d '[:space:]')"
@@ -389,14 +397,22 @@ print(
     # Windowed on purpose: without --since/--until this would re-scan the whole
     # ~500MB validator.log every rotation (~30x/day) and re-report every prior
     # rotation's bundles.
+    #
+    # --since is deliberately BAM_LOOKBACK_SECONDS earlier than our own window,
+    # and --leader-slots then pins the bundle count to the log region where our
+    # slots actually appear. Before that pinning, this reported 0 bundles for a
+    # healthy BAM on 8 of 15 rotations (2026-08-09) because capture_start_time
+    # landed after the ~1.6s burst had already finished.
     local bam_json_file="$OUTPUT_DIR/bam_activity_${timestamp}.json"
     local bam_line=""
     if [[ -x "$BAM_ACTIVITY_SCRIPT" ]]; then
-        if "$BAM_ACTIVITY_SCRIPT" --since "$capture_start_time" \
-                --until "$capture_end_time" --json > "$bam_json_file" 2>/dev/null; then
+        if "$BAM_ACTIVITY_SCRIPT" --since "$(( capture_start_time - BAM_LOOKBACK_SECONDS ))" \
+                --until "$capture_end_time" --leader-slots "$leader_slots_csv" \
+                --json > "$bam_json_file" 2>/dev/null; then
             bam_line=$(python3 -c "
 import json
-d = json.load(open('$bam_json_file'))['bam']
+j = json.load(open('$bam_json_file'))
+d = j['bam']
 rate = d.get('send_rate_pct')
 print(
     d.get('bundles_received', 0),
@@ -406,6 +422,7 @@ print(
     d.get('outbound_fail', 0),
     d.get('heartbeats_total', 0),
     d.get('unhealthy_connection_events', 0),
+    1 if j.get('bam_window', {}).get('leader_window_found') else 0,
 )
 " 2>/dev/null)
         else
@@ -414,9 +431,9 @@ print(
     fi
 
     local bam_bundles bam_sent bam_rate bam_sched_fail bam_out_fail
-    local bam_heartbeats bam_unhealthy
+    local bam_heartbeats bam_unhealthy bam_anchored
     read -r bam_bundles bam_sent bam_rate bam_sched_fail bam_out_fail \
-            bam_heartbeats bam_unhealthy <<< "$bam_line"
+            bam_heartbeats bam_unhealthy bam_anchored <<< "$bam_line"
     bam_bundles="${bam_bundles:-0}"
     bam_sent="${bam_sent:-0}"
     bam_rate="${bam_rate:-na}"
@@ -424,6 +441,9 @@ print(
     bam_out_fail="${bam_out_fail:-0}"
     bam_heartbeats="${bam_heartbeats:-0}"
     bam_unhealthy="${bam_unhealthy:-0}"
+    # 0 = we could not find our leader slots in the log, so the bundle count is
+    # a fallback over the wall-clock window and must not raise a BAM alert.
+    bam_anchored="${bam_anchored:-0}"
 
     local capture_duration=$(( capture_end_time - capture_start_time ))
     local slot_range="${first_slot}–${last_slot}"
@@ -515,7 +535,15 @@ print(
     fi
 
     if (( bam_present == 1 )); then
-    desc+=$'\n'"**BAM:** ${bam_bundles} bundles → ${bam_sent} sent (${bam_rate}%), ${bam_heartbeats} heartbeats"
+    # Bundles are counted over the leader-anchored sub-window; heartbeats are
+    # counted over the whole scan window (they stop during leader slots, so a
+    # leader-only heartbeat count would be near zero and useless as a liveness
+    # signal). Different spans, so the line says which is which.
+    local bam_scan_span=$(( BAM_LOOKBACK_SECONDS + capture_duration ))
+    desc+=$'\n'"**BAM:** ${bam_bundles} bundles → ${bam_sent} sent (${bam_rate}%) during our slots, ${bam_heartbeats} heartbeats in the last $(duration_fmt $bam_scan_span)"
+    if (( bam_anchored == 0 )); then
+        desc+=$'\n'"ℹ️ BAM bundle count unanchored — our leader slots were not found in the validator log for this window, so the count above may be incomplete."
+    fi
     if (( bam_sched_fail > 0 || bam_out_fail > 0 )); then
         desc+=$'\n'"⚠️ **BAM failures:** ${bam_sched_fail} scheduler, ${bam_out_fail} outbound"
     fi
@@ -527,11 +555,20 @@ print(
     # Evaluated PER ROTATION on purpose: zero bundles outside a leader window is
     # normal (bundles only arrive while we lead), so "0 bundles" is only
     # meaningful when set against slots we actually produced.
+    #
+    # bam_anchored is the second half of that: a zero count is only evidence
+    # about BAM if we located our leader period in the log. If we did not, the
+    # count describes the wrong seconds and says nothing about BAM - never page
+    # on our own instrumentation gap. The note added above still surfaces it.
+    # The anchoring guard covers only the two bundle-derived checks. The
+    # unhealthy-connection count is taken over the whole window and stays live
+    # either way.
     if (( bam_present == 0 )); then
         : # no BAM on this validator - nothing to assert about it
-    elif (( produced_slots > 0 && bam_bundles == 0 )); then
+    elif (( bam_anchored == 1 && produced_slots > 0 && bam_bundles == 0 )); then
         bam_alert="BAM delivered 0 bundles across ${produced_slots} produced slot(s)"
-    elif [[ "$bam_rate" != "na" ]] && (( $(echo "$bam_rate < $BAM_MIN_SEND_RATE" | bc -l) )); then
+    elif (( bam_anchored == 1 )) && [[ "$bam_rate" != "na" ]] \
+            && (( $(echo "$bam_rate < $BAM_MIN_SEND_RATE" | bc -l) )); then
         bam_alert="BAM send rate ${bam_rate}% is below ${BAM_MIN_SEND_RATE}%"
     elif (( bam_unhealthy > 0 )); then
         bam_alert="${bam_unhealthy} unhealthy BAM connection event(s)"
@@ -571,7 +608,7 @@ print(
     if (( withdrawal_count > 0 )); then
         log "  ⚠️  Tip withdrawals: $withdrawal_count event(s), $withdrawal_sol SOL out"
     fi
-    log "  BAM: $bam_bundles bundles, $bam_sent sent (${bam_rate}%), $bam_heartbeats heartbeats, $bam_unhealthy unhealthy"
+    log "  BAM: $bam_bundles bundles, $bam_sent sent (${bam_rate}%), $bam_heartbeats heartbeats, $bam_unhealthy unhealthy, anchored=$bam_anchored"
     if [[ -n "$bam_alert" ]]; then
         log "  BAM ALERT: $bam_alert"
     fi
