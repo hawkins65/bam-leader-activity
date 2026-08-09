@@ -77,18 +77,41 @@ def save_state(state):
     os.replace(tmp, STATE_FILE)      # atomic: never leave a half-written state
 
 
-def collect(pattern, since_ts, until_ts):
-    """Load capture JSONs whose mtime falls in [since_ts, until_ts]."""
-    out = []
+def collect(pattern, prefix, since_ts, until_ts):
+    """Load capture JSONs in [since_ts, until_ts], keyed by their rotation stamp.
+
+    leader-capture-monitor.sh names both files for a rotation with the same
+    YYYYmmdd_HHMMSS stamp, so keying on it lets the BAM telemetry and the
+    revenue/slot data for a given rotation be paired back up.
+    """
+    out = {}
     for path in sorted(glob.glob(os.path.join(CAPTURES_DIR, pattern))):
         try:
             mtime = os.path.getmtime(path)
-            if since_ts <= mtime <= until_ts:
-                with open(path) as f:
-                    out.append(json.load(f))
+            if not (since_ts <= mtime <= until_ts):
+                continue
+            stamp = os.path.basename(path)[len(prefix):-len(".json")]
+            with open(path) as f:
+                out[stamp] = json.load(f)
         except Exception as e:
             log(f"skipping {path}: {e}")
     return out
+
+
+def produced_skipped(txn):
+    """Slots produced/skipped for a rotation, from slot-transactions.py.
+
+    Deliberately NOT taken from the BAM JSON: bam-leader-activity.py derives
+    leader slots from cost_tracker_stats/replay_stage lines, which frequently do
+    not appear inside a ~90s rotation window (observed 2026-08-09: 0 slots there
+    while slot-transactions.py saw 2,487 transactions). Using the BAM figure
+    would report zero slots for an entire epoch and silence the
+    produced-slots-but-no-bundles check entirely.
+    """
+    s = txn.get("summary", {}) if txn else {}
+    total = s.get("total_slots", 0) or 0
+    skipped = s.get("skipped_slots", 0) or 0
+    return max(total - skipped, 0), skipped
 
 
 def main():
@@ -115,8 +138,8 @@ def main():
     until_ts = time.time()
     reported_epoch = last_epoch if last_epoch is not None else current_epoch
 
-    bam = collect("bam_activity_*.json", since_ts, until_ts)
-    txns = collect("slot_txns_*.json", since_ts, until_ts)
+    bam = collect("bam_activity_*.json", "bam_activity_", since_ts, until_ts)
+    txns = collect("slot_txns_*.json", "slot_txns_", since_ts, until_ts)
     if not bam:
         log("no BAM captures in window - nothing to report")
         if not DRY_RUN:
@@ -124,26 +147,32 @@ def main():
         return 0
 
     rotations = len(bam)
-    bundles = sum(d.get("bam", {}).get("bundles_received", 0) for d in bam)
-    sent = sum(d.get("bam", {}).get("results_sent", 0) for d in bam)
-    sched_fail = sum(d.get("bam", {}).get("scheduler_fail", 0) for d in bam)
-    out_fail = sum(d.get("bam", {}).get("outbound_fail", 0) for d in bam)
-    unhealthy = sum(d.get("bam", {}).get("unhealthy_connection_events", 0) for d in bam)
-    heartbeats = sum(d.get("bam", {}).get("heartbeats_total", 0) for d in bam)
-    produced = sum(d.get("leader_slots", {}).get("produced", 0) for d in bam)
-    skipped = sum(d.get("leader_slots", {}).get("skipped", 0) for d in bam)
+    vals = bam.values()
+    bundles = sum(d.get("bam", {}).get("bundles_received", 0) for d in vals)
+    sent = sum(d.get("bam", {}).get("results_sent", 0) for d in vals)
+    sched_fail = sum(d.get("bam", {}).get("scheduler_fail", 0) for d in vals)
+    out_fail = sum(d.get("bam", {}).get("outbound_fail", 0) for d in vals)
+    unhealthy = sum(d.get("bam", {}).get("unhealthy_connection_events", 0) for d in vals)
+    heartbeats = sum(d.get("bam", {}).get("heartbeats_total", 0) for d in vals)
 
-    # Rotations where we produced slots but BAM delivered nothing - the failure
-    # that is invisible in revenue numbers alone.
-    dry_rotations = sum(
-        1 for d in bam
-        if d.get("leader_slots", {}).get("produced", 0) > 0
-        and d.get("bam", {}).get("bundles_received", 0) == 0
-    )
+    produced = skipped = 0
+    dry_rotations = 0
+    for stamp, bd in bam.items():
+        p, s = produced_skipped(txns.get(stamp))
+        produced += p
+        skipped += s
+        # The failure that is invisible in revenue numbers alone: we led, and BAM
+        # delivered nothing. Only counted where BAM is actually in use on this
+        # host (heartbeats present), same reasoning as the per-rotation alert.
+        got_bundles = bd.get("bam", {}).get("bundles_received", 0)
+        has_bam = bd.get("bam", {}).get("heartbeats_total", 0) > 0 or got_bundles > 0
+        if has_bam and p > 0 and got_bundles == 0:
+            dry_rotations += 1
+
     send_rate = (sent / bundles * 100) if bundles else None
 
-    tips = sum(t.get("summary", {}).get("total_tips_sol", 0) for t in txns)
-    fees = sum(t.get("summary", {}).get("total_fees_sol", 0) for t in txns)
+    tips = sum(t.get("summary", {}).get("total_tips_sol", 0) for t in txns.values())
+    fees = sum(t.get("summary", {}).get("total_fees_sol", 0) for t in txns.values())
     tips_per_bundle = (tips / bundles) if bundles else None
 
     lines = [
