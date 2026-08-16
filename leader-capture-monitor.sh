@@ -189,6 +189,12 @@ send_discord() {
     local title="$1"
     local description="$2"
     local severity="${3:-info}"
+    # A phone's Discord push notification shows the webhook USERNAME and almost
+    # nothing else — the embed title is not in it. A fixed "Leader Capture
+    # Monitor" therefore made every rotation look identical on a phone, so
+    # callers pass the per-rotation headline here and it becomes the sender
+    # name. Falls back to the static name for any caller that does not.
+    local username="${4:-$BOT_USERNAME}"
 
     if [[ -z "$DISCORD_WEBHOOK" ]]; then
         log "WARNING: No Discord webhook configured"
@@ -200,7 +206,7 @@ send_discord() {
 
     send_discord_embed "$DISCORD_WEBHOOK" "$severity" \
         "$title" "$description" \
-        username="$BOT_USERNAME" \
+        username="$username" \
         script_path="$SCRIPT_PATH" \
         pagerduty=false
 }
@@ -607,34 +613,49 @@ print(
 
     desc+=$'\n'"**Output:** ${text_file}"
 
-    # The title carries the DAY's running totals, not this rotation's, so the
+    # The headline carries the DAY's running totals, not this rotation's, so the
     # channel reads as a running tally without opening any embed:
     #   "AMS 1.40 35.95CU 9 Rotations"
     # Same three numbers as the two "Today" lines in the description above.
-    local title_sol title_cu title_rot
-    title_sol=$(printf '%.2f' "$day_total_to_val" 2>/dev/null || echo "$day_total_to_val")
-    local title="${HOST_LABEL} ${title_sol}"
+    # It is sent as the webhook USERNAME rather than the embed title, because a
+    # phone notification shows only the sender name — see send_discord().
+    local head_sol head_cu head_rot
+    head_sol=$(printf '%.2f' "$day_total_to_val" 2>/dev/null || echo "$day_total_to_val")
+    local headline="${HOST_LABEL} ${head_sol}"
     # Gated exactly like the "Today avg CU/block" line: with no produced blocks
     # the average is 0 and printing "0.00CU" would read as a real measurement.
     if (( day_produced > 0 )); then
-        title_cu=$(awk -v cu="$day_avg_cu" 'BEGIN{printf "%.2f", cu/1000000}')
-        title+=" ${title_cu}CU"
+        head_cu=$(awk -v cu="$day_avg_cu" 'BEGIN{printf "%.2f", cu/1000000}')
+        headline+=" ${head_cu}CU"
     fi
-    title_rot="Rotations"
-    (( day_n == 1 )) && title_rot="Rotation"
-    title+=" ${day_n} ${title_rot}"
+    head_rot="Rotations"
+    (( day_n == 1 )) && head_rot="Rotation"
+    headline+=" ${day_n} ${head_rot}"
 
+    # Exception markers ride in the headline too: they are worthless in the
+    # embed title if the phone never renders it.
     if (( total_txns == 0 )); then
-        title+=" — No Transactions"
+        headline+=" — No Transactions"
     elif (( withdrawal_count > 0 )); then
-        title+=" — ⚠️ Tip Withdrawal Detected"
+        headline+=" — ⚠️ Tip Withdrawal Detected"
     fi
     if [[ -n "$bam_alert" ]]; then
-        title="${title} — 🚨 BAM"
+        headline="${headline} — 🚨 BAM"
     fi
 
-    send_discord "$title" "$desc" "$severity"
-    log "Discord notification sent"
+    # Discord rejects a webhook username over 80 chars and drops the whole
+    # message; the exception suffixes above can push a long hostname fallback
+    # past that, so clamp rather than lose the report.
+    # iconv -c drops a trailing partial character: this unit runs with no locale
+    # set, so ${#headline} and the slice are BYTES, and cutting mid-emoji would
+    # hand jq invalid UTF-8 and lose the message that way instead.
+    if (( ${#headline} > 80 )); then
+        headline=$(printf '%s' "${headline:0:80}" | iconv -c -f UTF-8 -t UTF-8)
+    fi
+
+    # Static name to the embed title, running totals to the sender name.
+    send_discord "$BOT_USERNAME" "$desc" "$severity" "$headline"
+    log "Discord notification sent (headline: ${headline})"
 
     # Log summary locally
     log "Capture summary:"
