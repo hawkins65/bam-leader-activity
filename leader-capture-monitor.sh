@@ -116,6 +116,16 @@ DISCORD_WEBHOOK="$(cat "$HOME/.config/discord/webhook" 2>/dev/null | tr -d '[:sp
 DISCORD_EMBED_SCRIPT="$HOME/999_discord_embed.sh"
 BOT_USERNAME="Leader Capture Monitor"
 SCRIPT_PATH="$(hostname):$(readlink -f "${BASH_SOURCE[0]}")"
+# Short host label for the Discord embed title. The same file is deployed to all
+# three hosts that run this monitor, so the title has to say which one is
+# talking. Anything unmapped falls back to the bare hostname rather than an
+# abbreviation nobody would recognise.
+case "$(hostname)" in
+    new-amsterdam) HOST_LABEL="AMS" ;;
+    ogden)         HOST_LABEL="OGDEN" ;;
+    testnet-ogden) HOST_LABEL="TESTNET" ;;
+    *)             HOST_LABEL="$(hostname)" ;;
+esac
 
 # ── CLI flags ─────────────────────────────────────────────────────────────────
 
@@ -597,11 +607,27 @@ print(
 
     desc+=$'\n'"**Output:** ${text_file}"
 
-    local title="Leader Slot Report"
+    # The title carries the DAY's running totals, not this rotation's, so the
+    # channel reads as a running tally without opening any embed:
+    #   "AMS 1.40 35.95CU 9 Rotations"
+    # Same three numbers as the two "Today" lines in the description above.
+    local title_sol title_cu title_rot
+    title_sol=$(printf '%.2f' "$day_total_to_val" 2>/dev/null || echo "$day_total_to_val")
+    local title="${HOST_LABEL} ${title_sol}"
+    # Gated exactly like the "Today avg CU/block" line: with no produced blocks
+    # the average is 0 and printing "0.00CU" would read as a real measurement.
+    if (( day_produced > 0 )); then
+        title_cu=$(awk -v cu="$day_avg_cu" 'BEGIN{printf "%.2f", cu/1000000}')
+        title+=" ${title_cu}CU"
+    fi
+    title_rot="Rotations"
+    (( day_n == 1 )) && title_rot="Rotation"
+    title+=" ${day_n} ${title_rot}"
+
     if (( total_txns == 0 )); then
-        title="Leader Slot Report — No Transactions"
+        title+=" — No Transactions"
     elif (( withdrawal_count > 0 )); then
-        title="Leader Slot Report — ⚠️ Tip Withdrawal Detected"
+        title+=" — ⚠️ Tip Withdrawal Detected"
     fi
     if [[ -n "$bam_alert" ]]; then
         title="${title} — 🚨 BAM"
