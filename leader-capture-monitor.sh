@@ -633,7 +633,7 @@ print(
     desc+=$'\n'"**Today (${day_label}, since 18:15 CT):** ${day_fees} fees + ${day_tips_to_val} tips (${COMMISSION_PCT}%) = ${day_total_to_val} SOL to validator across ${day_n} rotation(s)"
     local day_votes_fmt
     day_votes_fmt=$(LC_NUMERIC=en_US.UTF-8 printf "%'d" "${day_votes:-0}" 2>/dev/null || echo "${day_votes:-0}")
-    desc+=$'\n'"**Today net:** ${day_net} SOL — ${day_total_to_val} − ${day_vote_cost} vote cost (${day_votes_fmt} votes)"
+    desc+=$'\n'"**Today net:** ${day_net} SOL (${day_total_to_val} − ${day_vote_cost} vote cost for ${day_votes_fmt} votes)"
     if (( day_produced > 0 )); then
         local day_avg_cu_fmt
         day_avg_cu_fmt=$(LC_NUMERIC=en_US.UTF-8 printf "%'d" "$day_avg_cu" 2>/dev/null || echo "$day_avg_cu")
