@@ -111,6 +111,16 @@ BAM_MIN_SEND_RATE=95          # alert below this % of bundles forwarded
 # appear in the log, so widening this cannot pull in a neighbour's rotation.
 BAM_LOOKBACK_SECONDS=300
 
+# Vote cost. Our validator submits exactly one vote transaction per slot and a
+# vote txn pays a flat 5000-lamport base fee (one signature), charged whether it
+# succeeds or errors. Counting landed signatures for the identity is therefore
+# an exact spend figure, not a model - and it drops when we miss votes, which is
+# precisely when the number matters.
+VOTE_LAMPORTS=5000            # base fee per vote txn
+VOTE_MAX_PAGES=20             # 1000 sigs/page; 20 pages ~ 20k slots ~ 2.2h
+VOTE_MAX_INTERVAL_SLOTS=20000 # clamp: a monitoring gap must not dump hours of
+                              # vote cost onto one rotation
+
 # Discord
 DISCORD_WEBHOOK="$(cat "$HOME/.config/discord/webhook" 2>/dev/null | tr -d '[:space:]')"
 DISCORD_EMBED_SCRIPT="$HOME/999_discord_embed.sh"
@@ -196,6 +206,14 @@ send_discord() {
     # name. Falls back to the static name for any caller that does not.
     local username="${4:-$BOT_USERNAME}"
 
+    # Testnet alerts must not ping a person. The shared embed helper tags the
+    # Discord user from the SEVERITY alone (warning/error/critical), so the
+    # pagerduty=false below does not suppress it. A local shadow of the helper's
+    # global turns the mention off for this host only, which keeps the file safe
+    # to deploy to AMS/ogden where the ping is still wanted.
+    local _DISCORD_TAG_USER_ID="${_DISCORD_TAG_USER_ID:-}"
+    [[ "$HOST_LABEL" == "TESTNET" ]] && _DISCORD_TAG_USER_ID=""
+
     if [[ -z "$DISCORD_WEBHOOK" ]]; then
         log "WARNING: No Discord webhook configured"
         return 1
@@ -225,17 +243,18 @@ central_day_label() {
 # (fees_sol tips_sol revenue_sol rotation_count) to stdout.
 update_daily_ledger() {
     local ts="$1" fees="$2" tips="$3" revenue="$4" slots="$5" first="$6" last="$7"
-    local cu="$8" produced="$9"
+    local cu="$8" produced="$9" vote_txns="${10}"
     local day
     day=$(central_day_label "$ts")
-    printf '{"ts":%d,"central_day":"%s","first_slot":%d,"last_slot":%d,"slots":%d,"produced_slots":%d,"fees_sol":%s,"tips_sol":%s,"revenue_sol":%s,"compute_units":%d}\n' \
-        "$ts" "$day" "$first" "$last" "$slots" "$produced" "$fees" "$tips" "$revenue" "$cu" >> "$DAILY_LEDGER"
-    python3 - "$DAILY_LEDGER" "$day" "$COMMISSION_PCT" <<'PY'
+    printf '{"ts":%d,"central_day":"%s","first_slot":%d,"last_slot":%d,"slots":%d,"produced_slots":%d,"fees_sol":%s,"tips_sol":%s,"revenue_sol":%s,"compute_units":%d,"vote_txns":%d}\n' \
+        "$ts" "$day" "$first" "$last" "$slots" "$produced" "$fees" "$tips" "$revenue" "$cu" "$vote_txns" >> "$DAILY_LEDGER"
+    python3 - "$DAILY_LEDGER" "$day" "$COMMISSION_PCT" "$VOTE_LAMPORTS" <<'PY'
 import json, sys
 path, day = sys.argv[1], sys.argv[2]
 comm_pct = float(sys.argv[3])
+vote_lamports = int(sys.argv[4])
 f = t = r = 0.0; n = 0
-cu_sum = 0; produced_sum = 0
+cu_sum = 0; produced_sum = 0; vote_sum = 0
 with open(path) as fh:
     for line in fh:
         try: d = json.loads(line)
@@ -249,10 +268,15 @@ with open(path) as fh:
         if "compute_units" in d and "produced_slots" in d:
             cu_sum += int(d.get("compute_units", 0) or 0)
             produced_sum += int(d.get("produced_slots", 0) or 0)
+        # Rows written before vote-cost tracking simply contribute 0.
+        vote_sum += int(d.get("vote_txns", 0) or 0)
 tips_to_val = t * comm_pct / 100
 total_to_val = f + tips_to_val
+vote_cost = vote_sum * vote_lamports / 1e9
+net_to_val = total_to_val - vote_cost
 avg_cu = (cu_sum // produced_sum) if produced_sum > 0 else 0
-print(f"{f:.6f} {t:.6f} {r:.6f} {n} {tips_to_val:.6f} {total_to_val:.6f} {avg_cu} {produced_sum}")
+print(f"{f:.6f} {t:.6f} {r:.6f} {n} {tips_to_val:.6f} {total_to_val:.6f} {avg_cu} {produced_sum}"
+      f" {vote_cost:.6f} {net_to_val:.6f} {vote_sum}")
 PY
 }
 
@@ -275,6 +299,39 @@ duration_fmt() {
 
 rpc_call() {
     curl -s --max-time 10 "$RPC_URL" -X POST -H "Content-Type: application/json" -d "$1"
+}
+
+# Count our identity's landed transactions in (from_slot, to_slot] - in practice
+# exactly our vote txns, one per slot. Pages getSignaturesForAddress backwards
+# from the chain head, so it also skips the slots after to_slot that belong to
+# the NEXT rotation's interval.
+#
+# Echoes "<count> exact" or "<count> est". "est" is the slot delta used as a
+# stand-in when the RPC fails or the range needs more than VOTE_MAX_PAGES pages;
+# it is right to within our vote-landing rate and keeps the report sending.
+count_vote_txns() {
+    local from_slot="$1" to_slot="$2"
+    local delta=$(( to_slot - from_slot ))
+    (( delta <= 0 )) && { echo "0 exact"; return; }
+
+    local before="" count=0 page=0 params resp n oldest
+    while (( page < VOTE_MAX_PAGES )); do
+        params="\"$VALIDATOR_IDENTITY\",{\"limit\":1000"
+        [[ -n "$before" ]] && params+=",\"before\":\"$before\""
+        params+="}"
+        resp=$(rpc_call "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getSignaturesForAddress\",\"params\":[$params]}")
+        n=$(jq -r '.result | length' <<< "$resp" 2>/dev/null)
+        [[ "$n" =~ ^[0-9]+$ ]] || { echo "$delta est"; return; }
+        (( n == 0 )) && { echo "$count exact"; return; }
+        count=$(( count + $(jq -r --argjson f "$from_slot" --argjson t "$to_slot" \
+            '[.result[] | select(.slot > $f and .slot <= $t)] | length' <<< "$resp") ))
+        oldest=$(jq -r '.result[-1].slot' <<< "$resp")
+        before=$(jq -r '.result[-1].signature' <<< "$resp")
+        (( oldest <= from_slot )) && { echo "$count exact"; return; }
+        (( n < 1000 )) && { echo "$count exact"; return; }
+        page=$(( page + 1 ))
+    done
+    echo "$delta est"
 }
 
 get_slot_duration() {
@@ -498,6 +555,32 @@ print(
     jito_to_validator=$(printf '%.6f' "$(echo "$total_tips_sol * $COMMISSION_PCT / 100" | bc -l)")
     total_to_validator=$(printf '%.6f' "$(echo "$total_fees_sol + $jito_to_validator" | bc -l)")
 
+    # ── Vote cost for the interval this rotation closes ──────────────────────
+    # Earnings arrive in bursts (our leader slots); vote fees are paid every
+    # slot, continuously. Charging each rotation for the votes since the PREVIOUS
+    # rotation makes the intervals tile the day, so the daily vote cost below is
+    # the real daily spend rather than a sample of the capture windows.
+    #
+    # Read the previous last_slot BEFORE update_daily_ledger appends this
+    # rotation's row, or we would read our own.
+    local prev_last_slot vote_txns=0 vote_mode="na" vote_cost_sol="0.000000"
+    local net_to_validator="$total_to_validator"
+    prev_last_slot=$(tail -n 1 "$DAILY_LEDGER" 2>/dev/null | jq -r '.last_slot // empty' 2>/dev/null)
+    if [[ "$prev_last_slot" =~ ^[0-9]+$ ]] && (( prev_last_slot < last_slot )); then
+        # A monitoring gap (restart, standby stint) must not dump hours of vote
+        # cost onto one rotation.
+        if (( last_slot - prev_last_slot > VOTE_MAX_INTERVAL_SLOTS )); then
+            prev_last_slot=$(( last_slot - VOTE_MAX_INTERVAL_SLOTS ))
+        fi
+        read -r vote_txns vote_mode <<< "$(count_vote_txns "$prev_last_slot" "$last_slot")"
+        vote_txns="${vote_txns:-0}"
+        vote_mode="${vote_mode:-est}"
+        vote_cost_sol=$(printf '%.6f' "$(echo "$vote_txns * $VOTE_LAMPORTS / 1000000000" | bc -l)")
+        net_to_validator=$(printf '%.6f' "$(echo "$total_to_validator - $vote_cost_sol" | bc -l)")
+    fi
+    local vote_txns_fmt
+    vote_txns_fmt=$(LC_NUMERIC=en_US.UTF-8 printf "%'d" "$vote_txns" 2>/dev/null || echo "$vote_txns")
+
     # Build Discord message
     local severity="info"
     if (( total_txns == 0 )); then
@@ -525,19 +608,32 @@ print(
     desc+=$'\n'"**Jito tips earned:** ${total_tips_sol} SOL (tip-PDA inflow during our slots)"
     desc+=$'\n'"**Jito to Validator:** ${jito_to_validator} SOL (${COMMISSION_PCT}% commission)"
     desc+=$'\n'"**Total to Validator:** ${total_to_validator} SOL"
+    if [[ "$vote_mode" != "na" ]]; then
+        if [[ "$vote_mode" == "est" ]]; then
+            desc+=$'\n'"**Vote cost:** ~${vote_cost_sol} SOL (est, ${vote_txns_fmt} slots since last rotation)"
+        else
+            desc+=$'\n'"**Vote cost:** ${vote_cost_sol} SOL (${vote_txns_fmt} votes since last rotation)"
+        fi
+        # Negative is normal and not an alert: a quiet rotation can earn less
+        # than the votes paid while waiting for it.
+        desc+=$'\n'"**Net to Validator:** ${net_to_validator} SOL"
+    fi
 
     # Update daily ledger and append rolling subtotal (since 18:15 CT)
     local day_line day_fees day_tips day_rev day_n day_tips_to_val day_total_to_val
-    local day_avg_cu day_produced
+    local day_avg_cu day_produced day_vote_cost day_net day_votes
     day_line=$(update_daily_ledger "$capture_end_time" \
         "$total_fees_sol" "$total_tips_sol" "$total_revenue_sol" \
         "$total_slots" "$first_slot" "$last_slot" \
-        "$total_compute_units" "$produced_slots")
+        "$total_compute_units" "$produced_slots" "$vote_txns")
     read -r day_fees day_tips day_rev day_n day_tips_to_val day_total_to_val \
-            day_avg_cu day_produced <<< "$day_line"
+            day_avg_cu day_produced day_vote_cost day_net day_votes <<< "$day_line"
     local day_label
     day_label=$(central_day_label "$capture_end_time")
     desc+=$'\n'"**Today (${day_label}, since 18:15 CT):** ${day_fees} fees + ${day_tips_to_val} tips (${COMMISSION_PCT}%) = ${day_total_to_val} SOL to validator across ${day_n} rotation(s)"
+    local day_votes_fmt
+    day_votes_fmt=$(LC_NUMERIC=en_US.UTF-8 printf "%'d" "${day_votes:-0}" 2>/dev/null || echo "${day_votes:-0}")
+    desc+=$'\n'"**Today net:** ${day_total_to_val} − ${day_vote_cost} vote cost (${day_votes_fmt} votes) = **${day_net} SOL**"
     if (( day_produced > 0 )); then
         local day_avg_cu_fmt
         day_avg_cu_fmt=$(LC_NUMERIC=en_US.UTF-8 printf "%'d" "$day_avg_cu" 2>/dev/null || echo "$day_avg_cu")
@@ -667,6 +763,10 @@ print(
     log "  Tips: $total_tips_sol SOL"
     log "  Jito to Validator: $jito_to_validator SOL (${COMMISSION_PCT}%)"
     log "  Total to Validator: $total_to_validator SOL"
+    if [[ "$vote_mode" != "na" ]]; then
+        log "  Vote cost: $vote_cost_sol SOL ($vote_txns_fmt, $vote_mode)"
+        log "  Net to Validator: $net_to_validator SOL"
+    fi
     if (( withdrawal_count > 0 )); then
         log "  ⚠️  Tip withdrawals: $withdrawal_count event(s), $withdrawal_sol SOL out"
     fi
