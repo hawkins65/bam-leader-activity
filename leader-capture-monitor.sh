@@ -117,9 +117,13 @@ BAM_LOOKBACK_SECONDS=300
 # an exact spend figure, not a model - and it drops when we miss votes, which is
 # precisely when the number matters.
 VOTE_LAMPORTS=5000            # base fee per vote txn
-VOTE_MAX_PAGES=20             # 1000 sigs/page; 20 pages ~ 20k slots ~ 2.2h
-VOTE_MAX_INTERVAL_SLOTS=20000 # clamp: a monitoring gap must not dump hours of
-                              # vote cost onto one rotation
+VOTE_MAX_PAGES=60             # 1000 sigs/page; must cover the longest gap
+                              # between our own leader rotations within one day
+                              # (30k slots observed on mainnet) or the count
+                              # degrades to the `est` fallback below
+VOTE_MAX_INTERVAL_SLOTS=20000 # clamp for the `est` fallback ONLY. An exact
+                              # on-chain count is right for any span; only an
+                              # estimate can invent hours of phantom cost
 
 # Discord
 DISCORD_WEBHOOK="$(cat "$HOME/.config/discord/webhook" 2>/dev/null | tr -d '[:space:]')"
@@ -239,6 +243,12 @@ central_day_label() {
           else { cmd = "TZ=\"'"$DAY_TZ"'\" date -d \"" $1 " -1 day\" +%Y-%m-%d"; cmd | getline y; close(cmd); print y } }'
 }
 
+# Epoch seconds of the DAY_ROLLOVER_HHMM boundary that opens central day $1.
+# The inverse of central_day_label; DST is handled by `date` in DAY_TZ.
+day_start_ts() {
+    TZ="$DAY_TZ" date -d "$1 ${DAY_ROLLOVER_HHMM:0:2}:${DAY_ROLLOVER_HHMM:2:2}" +%s
+}
+
 # Append a capture to the JSONL ledger and echo today's running totals
 # (fees_sol tips_sol revenue_sol rotation_count) to stdout.
 update_daily_ledger() {
@@ -306,15 +316,19 @@ rpc_call() {
 # from the chain head, so it also skips the slots after to_slot that belong to
 # the NEXT rotation's interval.
 #
+# With a third argument, signatures whose blockTime is at or before it are
+# excluded. The caller passes the 18:15 CT day boundary so a rotation that
+# straddles it is charged only for the votes on this side of it.
+#
 # Echoes "<count> exact" or "<count> est". "est" is the slot delta used as a
 # stand-in when the RPC fails or the range needs more than VOTE_MAX_PAGES pages;
 # it is right to within our vote-landing rate and keeps the report sending.
 count_vote_txns() {
-    local from_slot="$1" to_slot="$2"
+    local from_slot="$1" to_slot="$2" min_ts="${3:-0}"
     local delta=$(( to_slot - from_slot ))
     (( delta <= 0 )) && { echo "0 exact"; return; }
 
-    local before="" count=0 page=0 params resp n oldest
+    local before="" count=0 page=0 params resp n oldest oldest_ts
     while (( page < VOTE_MAX_PAGES )); do
         params="\"$VALIDATOR_IDENTITY\",{\"limit\":1000"
         [[ -n "$before" ]] && params+=",\"before\":\"$before\""
@@ -323,11 +337,14 @@ count_vote_txns() {
         n=$(jq -r '.result | length' <<< "$resp" 2>/dev/null)
         [[ "$n" =~ ^[0-9]+$ ]] || { echo "$delta est"; return; }
         (( n == 0 )) && { echo "$count exact"; return; }
-        count=$(( count + $(jq -r --argjson f "$from_slot" --argjson t "$to_slot" \
-            '[.result[] | select(.slot > $f and .slot <= $t)] | length' <<< "$resp") ))
+        count=$(( count + $(jq -r --argjson f "$from_slot" --argjson t "$to_slot" --argjson m "$min_ts" \
+            '[.result[] | select(.slot > $f and .slot <= $t
+                                 and ($m == 0 or (.blockTime // 0) > $m))] | length' <<< "$resp") ))
         oldest=$(jq -r '.result[-1].slot' <<< "$resp")
+        oldest_ts=$(jq -r '.result[-1].blockTime // 0' <<< "$resp")
         before=$(jq -r '.result[-1].signature' <<< "$resp")
         (( oldest <= from_slot )) && { echo "$count exact"; return; }
+        (( min_ts > 0 && oldest_ts > 0 && oldest_ts <= min_ts )) && { echo "$count exact"; return; }
         (( n < 1000 )) && { echo "$count exact"; return; }
         page=$(( page + 1 ))
     done
@@ -567,14 +584,23 @@ print(
     local net_to_validator="$total_to_validator"
     prev_last_slot=$(tail -n 1 "$DAILY_LEDGER" 2>/dev/null | jq -r '.last_slot // empty' 2>/dev/null)
     if [[ "$prev_last_slot" =~ ^[0-9]+$ ]] && (( prev_last_slot < last_slot )); then
-        # A monitoring gap (restart, standby stint) must not dump hours of vote
-        # cost onto one rotation.
-        if (( last_slot - prev_last_slot > VOTE_MAX_INTERVAL_SLOTS )); then
-            prev_last_slot=$(( last_slot - VOTE_MAX_INTERVAL_SLOTS ))
-        fi
-        read -r vote_txns vote_mode <<< "$(count_vote_txns "$prev_last_slot" "$last_slot")"
+        # Clip the interval at the 18:15 CT day boundary. Votes cast before it
+        # were paid out of yesterday's identity balance and were swept by
+        # collect_balance.sh that evening, so charging them to today made
+        # "Today net" disagree with the sweep by the length of whichever
+        # rotation gap happened to straddle the boundary.
+        local day_start
+        day_start=$(day_start_ts "$(central_day_label "$capture_end_time")")
+        read -r vote_txns vote_mode <<< "$(count_vote_txns "$prev_last_slot" "$last_slot" "$day_start")"
         vote_txns="${vote_txns:-0}"
         vote_mode="${vote_mode:-est}"
+        # An exact on-chain count is correct however long the span, so clamp the
+        # estimate and only the estimate. The old clamp was on the slot span and
+        # fired on ordinary 2h+ gaps between our own leader rotations, silently
+        # dropping real vote fees (0.068 SOL on 2026-08-24, over 3 rotations).
+        if [[ "$vote_mode" == "est" ]] && (( vote_txns > VOTE_MAX_INTERVAL_SLOTS )); then
+            vote_txns=$VOTE_MAX_INTERVAL_SLOTS
+        fi
         vote_cost_sol=$(printf '%.6f' "$(echo "$vote_txns * $VOTE_LAMPORTS / 1000000000" | bc -l)")
         net_to_validator=$(printf '%.6f' "$(echo "$total_to_validator - $vote_cost_sol" | bc -l)")
     fi
