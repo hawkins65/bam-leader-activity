@@ -75,9 +75,20 @@ export NETWORK
 case "$NETWORK" in
     mainnet)
         RPC_URL="${MAINNET_RPC_URL:?MAINNET_RPC_URL not set in $VALIDATOR_CONFIG}"
+        SLOT_DURATION_DEFAULT=0.420   # nominal seconds per slot
+        SLOT_DURATION_MIN=0.30        # band a measured sample must fall in to
+        SLOT_DURATION_MAX=0.80        # be trusted; see get_slot_duration
         ;;
     testnet)
         RPC_URL="${TESTNET_RPC_URL:?TESTNET_RPC_URL not set in $VALIDATOR_CONFIG}"
+        # Testnet runs materially faster than mainnet - measured 0.187-0.208 s
+        # per slot on 2026-08-26. These bounds used to be mainnet's [0.30, 0.80]
+        # for both networks, which rejected every real testnet sample and
+        # substituted 0.420, making every slot-duration-derived figure here
+        # about 2.1x too long.
+        SLOT_DURATION_DEFAULT=0.195
+        SLOT_DURATION_MIN=0.10
+        SLOT_DURATION_MAX=0.50
         ;;
 esac
 VALIDATOR_IDENTITY="${VALIDATOR_IDENTITY:?VALIDATOR_IDENTITY not set in $VALIDATOR_CONFIG}"
@@ -352,9 +363,11 @@ count_vote_txns() {
 }
 
 get_slot_duration() {
-    # Returns seconds per slot. Mainnet runs ~0.4s; clamp anything outside
-    # [0.3, 0.8] to the default — a bad value here propagates into the merge
-    # logic and can collapse all leader rotations into one giant window.
+    # Returns seconds per slot, measured from the chain and sanity-bounded to
+    # the current network's band (set alongside RPC_URL above). Anything outside
+    # it falls back to that network's nominal — a bad value here propagates into
+    # the merge logic and can collapse all leader rotations into one giant
+    # window, so the upper bound is the one that matters.
     local result
     result=$(rpc_call '{"jsonrpc":"2.0","id":1,"method":"getRecentPerformanceSamples","params":[1]}')
     local dur
@@ -364,8 +377,9 @@ get_slot_duration() {
         else empty
         end' 2>/dev/null)
     # Sanity-check: reject NaN, empty, or out-of-band values
-    if [[ -z "$dur" ]] || ! awk -v d="$dur" 'BEGIN{exit !(d >= 0.3 && d <= 0.8)}'; then
-        dur="0.420"
+    if [[ -z "$dur" ]] || ! awk -v d="$dur" -v lo="$SLOT_DURATION_MIN" -v hi="$SLOT_DURATION_MAX" \
+            'BEGIN{exit !(d >= lo && d <= hi)}'; then
+        dur="$SLOT_DURATION_DEFAULT"
     fi
     echo "$dur"
 }

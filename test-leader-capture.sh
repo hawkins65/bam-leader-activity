@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Self-check for the two pieces of vote-window logic in leader-capture-monitor.sh:
-# the 18:15 CT day-boundary timestamp, and count_vote_txns' clipping of a
-# rotation interval that straddles that boundary.
+# Self-check for leader-capture-monitor.sh's numeric logic:
 #
-# Both are money paths: an error here silently over- or under-states the daily
-# vote cost, which is what "Today net" is compared against by the collect_balance
-# sweep. Run it after touching either function.
+#   - the 18:15 CT day boundary, and count_vote_txns' clipping of a rotation
+#     interval that straddles it. A money path: an error silently over- or
+#     under-states the daily vote cost, which is what "Today net" is compared
+#     against by the collect_balance sweep.
+#   - get_slot_duration's per-network sanity band. Too high a value collapses
+#     separate leader rotations into one capture window; a band that excludes
+#     the network's real slot time silently substitutes the nominal.
 #
-#   ./test-vote-window.sh   # exits 0 on pass, 1 on the first failure
+#   ./test-leader-capture.sh   # exits 0 on pass, 1 on the first failure
 set -uo pipefail
 
 SCRIPT="${1:-$(dirname "$(readlink -f "$0")")/leader-capture-monitor.sh}"
@@ -19,6 +21,15 @@ eval "$(grep -E '^(DAY_ROLLOVER_HHMM|DAY_TZ|VOTE_MAX_INTERVAL_SLOTS)=' "$SCRIPT"
 eval "$(awk '/^central_day_label\(\) \{/,/^\}/' "$SCRIPT")"
 eval "$(awk '/^day_start_ts\(\) \{/,/^\}/' "$SCRIPT")"
 eval "$(awk '/^count_vote_txns\(\) \{/,/^\}/' "$SCRIPT")"
+eval "$(awk '/^get_slot_duration\(\) \{/,/^\}/' "$SCRIPT")"
+# The per-network bands live in a `case $NETWORK` block that cannot be sourced
+# without a validator config, so read them straight out of that block.
+net_band() { awk -v net="$1" '
+    $0 ~ "^ *"net"\\)" {inblock=1}
+    inblock && /SLOT_DURATION_(DEFAULT|MIN|MAX)=/ {
+        sub(/^ */,""); sub(/ *#.*/,""); print
+    }
+    inblock && /^ *;;/ {exit}' "$SCRIPT"; }
 
 VOTE_MAX_PAGES=5
 VALIDATOR_IDENTITY="TestIdentity1111111111111111111111111111111"
@@ -70,5 +81,39 @@ rpc_call() { echo 'not json'; }
 read -r n mode <<< "$(count_vote_txns 0 999999)"
 check "rpc failure falls back to est" "est" "$mode"
 (( n > VOTE_MAX_INTERVAL_SLOTS )) && check "est exceeds clamp (caller clamps it)" "1" "1"
+
+# ── get_slot_duration per-network band ──────────────────────────────────────
+# A getRecentPerformanceSamples reply of $2 slots in 60s.
+sample() { rpc_call() { echo "{\"result\":[{\"samplePeriodSecs\":60,\"numSlots\":$1}]}"; }; }
+in_range() { awk -v d="$1" -v lo="$2" -v hi="$3" 'BEGIN{exit !(d >= lo && d <= hi)}'; }
+
+for net in mainnet testnet; do
+    band=$(net_band "$net")
+    [[ -n "$band" ]] || { echo "FAIL no $net band found in $SCRIPT"; fail=1; continue; }
+    eval "$band"
+    check "$net band is ordered" "1" \
+        "$(in_range "$SLOT_DURATION_DEFAULT" "$SLOT_DURATION_MIN" "$SLOT_DURATION_MAX" && echo 1 || echo 0)"
+done
+
+# 307 slots in 60s = 0.1954 s/slot, a real testnet reading measured 2026-08-26.
+# It must be accepted on testnet and must NOT be silently replaced by 0.420 -
+# that substitution was the bug.
+eval "$(net_band testnet)"; sample 307
+d=$(get_slot_duration)
+check "testnet accepts a real testnet sample" "1" "$(in_range "$d" 0.15 0.25 && echo 1 || echo 0)"
+
+# 150 slots in 60s = 0.4 s/slot, a real mainnet reading.
+eval "$(net_band mainnet)"; sample 150
+d=$(get_slot_duration)
+check "mainnet accepts a real mainnet sample" "1" "$(in_range "$d" 0.35 0.45 && echo 1 || echo 0)"
+
+# The upper bound is the one that matters: too long a slot merges separate
+# rotations into one window. 50 slots in 60s = 1.2 s/slot must be rejected.
+sample 50
+check "mainnet rejects an over-long slot" "$SLOT_DURATION_DEFAULT" "$(get_slot_duration)"
+
+# numSlots 0 yields no value at all; the nominal must stand in.
+sample 0
+check "zero numSlots falls back to nominal" "$SLOT_DURATION_DEFAULT" "$(get_slot_duration)"
 
 exit $fail
