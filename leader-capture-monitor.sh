@@ -752,11 +752,12 @@ print(
     # The headline carries the DAY's running totals, not this rotation's, so the
     # channel reads as a running tally without opening any embed:
     #   "AMS 1.40 35.95CU 9 Rotations"
-    # Same three numbers as the two "Today" lines in the description above.
+    # The SOL figure is the day NET (after vote cost), matching the "Today net"
+    # line - gross is one tap away in the embed, net is the number that matters.
     # It is sent as the webhook USERNAME rather than the embed title, because a
     # phone notification shows only the sender name — see send_discord().
     local head_sol head_cu head_rot
-    head_sol=$(printf '%.2f' "$day_total_to_val" 2>/dev/null || echo "$day_total_to_val")
+    head_sol=$(printf '%.2f' "$day_net" 2>/dev/null || echo "$day_net")
     local headline="${HOST_LABEL} ${head_sol}"
     # Gated exactly like the "Today avg CU/block" line: with no produced blocks
     # the average is 0 and printing "0.00CU" would read as a real measurement.
