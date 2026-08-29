@@ -18,28 +18,58 @@ from collections import Counter
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-# Skip unless the running validator is using the staked identity.
-if subprocess.run(["/home/sol/bam-leader-activity/role-gate.sh"]).returncode != 0:
-    sys.exit(0)
-
 _webhook_path = Path.home() / ".config" / "discord" / "webhook"
-if _webhook_path.exists():
-    DISCORD_WEBHOOK = _webhook_path.read_text().strip()
-else:
-    print("ERROR: Discord webhook not found at ~/.config/discord/webhook", file=sys.stderr)
-    sys.exit(1)
+DISCORD_WEBHOOK = _webhook_path.read_text().strip() if _webhook_path.exists() else ""
+
+# Skip unless the running validator is using the staked identity. Both of these
+# used to exit at import, which meant the file could not be imported anywhere
+# but a live validator host - see ops/ha/tests/hourly_leader_revenue_test.py.
+if __name__ == "__main__":
+    if subprocess.run(["/home/sol/bam-leader-activity/role-gate.sh"]).returncode != 0:
+        sys.exit(0)
+    if not DISCORD_WEBHOOK:
+        print("ERROR: Discord webhook not found at ~/.config/discord/webhook", file=sys.stderr)
+        sys.exit(1)
 DISCORD_EMBED_SCRIPT = Path.home() / "999_discord_embed.sh"
 BOT_USERNAME = "Validator Log Summary"
 HOSTNAME = subprocess.run(['hostname'], capture_output=True, text=True).stdout.strip()
 SCRIPT_PATH = f"{HOSTNAME}:{os.path.abspath(__file__)}"
-VALIDATOR_IDENTITY = subprocess.run(
-    ['solana', 'address'], capture_output=True, text=True
-).stdout.strip() or "unknown"
+# 2026-08-28: this was ['solana', 'address'] with no path. `solana` is not on
+# PATH for this user - not under cron, not even interactively - so this raised an
+# uncaught FileNotFoundError at import and killed the ENTIRE script on every run.
+# It had been doing so ~24x/day for at least the full 7-day log retention; nobody
+# saw it because the monitor that reads this log was itself broken. Absolute path
+# plus a guard so a missing/renamed binary degrades to "unknown" instead of
+# taking the whole summary down.
+SOLANA_BIN = os.environ.get("SOLANA_BIN") or str(
+    Path.home() / ".local/share/solana/install/active_release/bin/solana")
+try:
+    VALIDATOR_IDENTITY = subprocess.run(
+        [SOLANA_BIN, 'address'], capture_output=True, text=True, timeout=15
+    ).stdout.strip() or "unknown"
+except (FileNotFoundError, OSError, subprocess.SubprocessError):
+    VALIDATOR_IDENTITY = "unknown"
 LOG_DIR = Path.home() / "logs"
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+# 2026-08-28: claude-sonnet-4-20250514 was retired and returned HTTP 404 on EVERY
+# run (~24x/day for at least the full log retention). claude-opus-5 is the current
+# default model. Opus 5 runs adaptive thinking ON by default, which is why
+# max_tokens was raised (thinking tokens count against it) and why the response
+# parser below no longer assumes content[0] is the text block - it is a thinking
+# block. To trade quality for cost on this route, add
+# "output_config": {"effort": "low"} to the payload.
+CLAUDE_MODEL = "claude-opus-5"
 LARGE_FILE_THRESHOLD = 100 * 1024 * 1024  # 100MB
 VALIDATOR_LOG = LOG_DIR / "validator.log"
 CAPTURES_DIR = Path.home() / "bam-leader-activity" / "captures"
+# Per-rotation ledger written by leader-capture-monitor.sh. It is the only place
+# the vote-transaction count lives - slot-transactions.py reports what landed in
+# OUR blocks, and votes are paid in everyone else's.
+DAILY_LEDGER = Path.home() / "bam-leader-activity" / "daily_totals.jsonl"
+VOTE_LAMPORTS = 5000   # flat base fee per vote txn (one signature)
+VALIDATOR_SH = Path.home() / "validator.sh"
+# The same file runs on mainnet and testnet hosts; only the prompt's network word
+# differed, which is why the testnet copy used to be a separate md5.
+NETWORK = "testnet" if HOSTNAME.startswith("testnet") else "mainnet"
 SLOT_TRANSACTIONS_SCRIPT = Path.home() / "bam-leader-activity" / "slot-transactions.py"
 
 # BAM connection error patterns (from bam-hourly-summary.py)
@@ -99,6 +129,17 @@ TRACKED_LOW_SEVERITY = [
         "description": "BAM/Jito block engine connection retries (auto-recovering, monitored by dedicated BAM monitor)",
     },
     {
+        # 2026-08-28: this fired ~59/5min for the whole time new-amsterdam held the
+        # JUNK identity and produced a spurious HIGH "BAM connectivity degraded"
+        # summary. It is EXPECTED on a standby: BAM refuses any validator that is
+        # not on the leader schedule, and the junk identity never is. It stopped
+        # ~4 min after promotion on its own. Only worth attention if it persists
+        # while this host holds the STAKED identity.
+        "name": "BAM rejects non-leader identity",
+        "pattern": re.compile(r'bam_connection\].*Validator is not on the leader schedule'),
+        "description": "BAM refusing a validator that is not on the leader schedule - NORMAL while this host is the HA standby holding the unstaked/junk identity; clears within minutes of promotion. Only escalate if it continues while the host is staked and voting.",
+    },
+    {
         "name": "Dead Slot from Other Leaders",
         "pattern": re.compile(r'datapoint: replay-stage-mark_dead_slot'),
         "description": "Other validators' bad blocks rejected during replay (normal network behavior)",
@@ -131,7 +172,13 @@ TRACKED_LOW_SEVERITY = [
 ]
 
 # Solana log timestamp: [2026-02-15T00:00:06.663056547Z ...]
-TIMESTAMP_RE = re.compile(r'^\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})')
+# 2026-08-29: this used to require a literal "[" and an ISO "T" separator, which
+# only validator.log actually writes. Every other log in ~/logs uses
+# "[YYYY-MM-DD HH:MM:SS]" (log() below, bam_monitor) or a bare
+# "YYYY-MM-DD HH:MM:SS UTC" prefix (bam-failover). None of those parsed, so the
+# cutoff filter never applied to them - see _collect_errors_forward. All fleet
+# hosts run Etc/UTC, so a naive timestamp is read as UTC.
+TIMESTAMP_RE = re.compile(r'^\[?(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})')
 
 
 def log(msg):
@@ -183,34 +230,103 @@ def collect_errors_from_file(filepath, cutoff_time, verbose=False):
         return _collect_errors_forward(filepath, cutoff_time)
 
 
+# 2026-08-28: errors[] previously grew without limit; the 8000-char truncation
+# further down applies only AFTER the whole list is built. validator.log grew
+# 143 GB in one day during an incident, and a fault-flood hour could build a
+# multi-GB list of Python strings before that truncation ever ran. Cap while
+# appending, and make the cap visible in the output rather than silent.
+MAX_ERRORS_COLLECTED = 5000
+
+
+# A Python traceback's frames match neither ERROR_PATTERN nor TIMESTAMP_RE, so a
+# line-at-a-time collector kept the bare "Traceback (most recent call last):"
+# header and threw away the exception type and stack - the only two things that
+# make it triageable. Frames are appended to the header's entry, so one traceback
+# stays ONE error for counting and dedup purposes.
+CONTINUATION_RE = re.compile(
+    r'^(?:\s+\S|\.{3}|[A-Za-z_][\w.]*(?:Error|Exception|Interrupt|Exit)\b|'
+    r'During handling of|The above exception)')
+MAX_TRACEBACK_FRAMES = 25
+
+
 def _process_line(line, errors, tracked_counts):
-    """Check if a line is an error, classify it, and add to appropriate bucket."""
+    """Check if a line is an error, classify it, and add to appropriate bucket.
+
+    Returns True when the line was appended as a genuine error, so the caller
+    can attach the traceback frames that follow it."""
     if ERROR_PATTERN.search(line) and not EXCLUDE_PATTERN.search(line):
         kind, idx = classify_error(line)
         if kind == 'tracked':
             tracked_counts[idx] += 1
-        else:
+        elif len(errors) < MAX_ERRORS_COLLECTED:
             errors.append(line.rstrip())
+            return True
+        elif len(errors) == MAX_ERRORS_COLLECTED:
+            errors.append(
+                f"... error collection capped at {MAX_ERRORS_COLLECTED} lines; "
+                "further errors in this file were not collected")
+    return False
 
 
 def _collect_errors_forward(filepath, cutoff_time):
     """Read file forward, collect errors within time window."""
     errors = []
     tracked_counts = Counter()
+    # 2026-08-29: a line with no parseable timestamp used to skip the cutoff
+    # check entirely, so an untimestamped record - a Python traceback dumped
+    # into the log by cron - was re-reported EVERY hour, forever. 18 tracebacks
+    # from the 08-28 `solana`-not-on-PATH bug were still being posted as "18
+    # errors this hour" a day after that bug was fixed. A line with no timestamp
+    # now inherits the timestamp of the record it belongs to.
+    last_ts = None
+    preamble = []   # lines before the file's FIRST timestamp; they belong to a
+                    # record that started in an already-rotated file, so they
+                    # inherit the first timestamp we do see.
+    frames = 0
+
+    def take(line):
+        nonlocal frames
+        if frames and errors and CONTINUATION_RE.match(line):
+            frames -= 1
+            errors[-1] += "\n" + line.rstrip()
+            return
+        frames = MAX_TRACEBACK_FRAMES if _process_line(line, errors, tracked_counts) else 0
+
     try:
         with open(filepath, 'r', errors='replace') as f:
             for line in f:
                 ts = parse_timestamp(line)
-                if ts and ts < cutoff_time:
+                if ts is None:
+                    if last_ts is None:
+                        if len(preamble) < MAX_ERRORS_COLLECTED:
+                            preamble.append(line)
+                    elif last_ts >= cutoff_time:
+                        take(line)
                     continue
-                _process_line(line, errors, tracked_counts)
+                if last_ts is None and preamble:
+                    if ts >= cutoff_time:
+                        for held in preamble:
+                            take(held)
+                    preamble.clear()
+                last_ts = ts
+                if ts >= cutoff_time:
+                    take(line)
     except Exception as e:
         log(f"  Error reading {filepath}: {e}")
+    if last_ts is None:
+        # No timestamp anywhere in the file - we cannot date anything in it, so
+        # keep the old behaviour rather than going silently blind on it.
+        for held in preamble:
+            take(held)
     return errors, tracked_counts
 
 
 def _collect_errors_tac(filepath, cutoff_time):
-    """Read file from end using tac, stop when we pass the time window."""
+    """Read file from end using tac, stop when we pass the time window.
+
+    No traceback joining here: tac yields lines in reverse, so frames arrive
+    before their header. This path only runs on files >100MB - in practice just
+    validator.log, whose lines are all timestamped and single-line."""
     errors = []
     tracked_counts = Counter()
     try:
@@ -351,6 +467,55 @@ def extract_bam_summary(cutoff_time, verbose=False):
     }
 
 
+def read_commission_pct():
+    """MEV commission from validator.sh (--commission-bps), as a percent.
+
+    Read per run, not cached at import: a commission change on the box has to
+    show up in the next report, the way leader-capture-monitor.sh does it.
+    """
+    try:
+        m = re.search(r'--commission-bps\s+(\d+)', VALIDATOR_SH.read_text())
+        return int(m.group(1)) / 100 if m else 0.0
+    except OSError:
+        return 0.0
+
+
+def sum_vote_txns(cutoff_time, verbose=False):
+    """Vote transactions paid for, from leader-capture-monitor.sh's ledger.
+
+    Each ledger row carries the votes counted since the PREVIOUS rotation, so
+    the first row inside the window reaches back before it. That fuzz is the
+    price of not re-counting signatures over RPC here; the number is labelled
+    "charged at rotations" in the embed for exactly that reason.
+
+    Returns None when there is no ledger to read, which drops the vote and net
+    lines rather than printing a zero that looks like a free hour.
+    """
+    if not DAILY_LEDGER.exists():
+        return None
+    cutoff_ts = cutoff_time.timestamp()
+    total = 0
+    rows = 0
+    try:
+        with open(DAILY_LEDGER) as fh:
+            for line in fh:
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if float(d.get("ts", 0)) < cutoff_ts:
+                    continue
+                total += int(d.get("vote_txns", 0) or 0)
+                rows += 1
+    except OSError as e:
+        if verbose:
+            log(f"  Could not read {DAILY_LEDGER}: {e}")
+        return None
+    if verbose:
+        log(f"  Ledger: {rows} row(s) in window, {total} vote txns")
+    return total if rows > 0 else None
+
+
 def collect_leader_slot_earnings(cutoff_time, verbose=False):
     """Collect leader slot transaction/earnings data from capture JSON files
     written by leader-capture-monitor.sh during the past hour.
@@ -372,7 +537,11 @@ def collect_leader_slot_earnings(cutoff_time, verbose=False):
     total_skipped = 0
     tip_anomaly_count = 0
     tip_anomaly_lamports = 0
+    withdrawal_count = 0
+    withdrawal_lamports = 0
+    total_compute_units = 0
     rotations = 0
+    first_mtime = None
 
     for json_file in sorted(CAPTURES_DIR.glob("slot_txns_*.json")):
         # Check file modification time against cutoff
@@ -399,7 +568,12 @@ def collect_leader_slot_earnings(cutoff_time, verbose=False):
             total_skipped += summary.get("skipped_slots", 0)
             tip_anomaly_count += summary.get("tip_anomaly_count", 0)
             tip_anomaly_lamports += summary.get("tip_anomaly_lamports", 0)
+            withdrawal_count += summary.get("tip_withdrawal_count", 0)
+            withdrawal_lamports += summary.get("tip_withdrawal_lamports", 0)
+            total_compute_units += summary.get("total_compute_units", 0)
             rotations += 1
+            if first_mtime is None or mtime < first_mtime:
+                first_mtime = mtime
             if verbose:
                 log(f"  Capture {json_file.name}: {summary.get('total_non_vote_transactions', 0)} txns, "
                     f"{summary.get('total_fees_sol', 0):.6f} SOL fees, "
@@ -411,8 +585,25 @@ def collect_leader_slot_earnings(cutoff_time, verbose=False):
     if rotations == 0:
         return None
 
+    produced = total_slots - total_skipped
+    commission_pct = read_commission_pct()
+    tips_to_validator = total_tips * commission_pct / 100
+    total_to_validator = total_fees + tips_to_validator
+    vote_txns = sum_vote_txns(cutoff_time, verbose=verbose)
+    vote_lamports = None if vote_txns is None else vote_txns * VOTE_LAMPORTS
+
     return {
         "rotations": rotations,
+        "commission_pct": commission_pct,
+        "tips_to_validator_sol": tips_to_validator / 1e9,
+        "total_to_validator_sol": total_to_validator / 1e9,
+        "vote_txns": vote_txns,
+        "vote_cost_sol": None if vote_lamports is None else vote_lamports / 1e9,
+        "net_to_validator_sol": (None if vote_lamports is None
+                                 else (total_to_validator - vote_lamports) / 1e9),
+        "avg_cu_per_block": (total_compute_units // produced) if produced > 0 else 0,
+        "withdrawal_count": withdrawal_count,
+        "withdrawal_sol": withdrawal_lamports / 1e9,
         "total_slots": total_slots,
         "skipped_slots": total_skipped,
         "produced_slots": total_slots - total_skipped,
@@ -439,9 +630,29 @@ def format_leader_embed(leader_data):
     if leader_data["skipped_slots"] > 0:
         lines.append(f"**Skipped:** {leader_data['skipped_slots']}")
     lines.append(f"**Transactions:** {leader_data['total_txns']:,} ({leader_data['successful']:,} success, {leader_data['failed']:,} failed)")
+    if leader_data.get("avg_cu_per_block", 0) > 0:
+        lines.append(f"**Avg CU/block:** {leader_data['avg_cu_per_block']:,} CU "
+                     f"(over {leader_data['produced_slots']} produced)")
     lines.append(f"**Fees earned:** {leader_data['total_fees_sol']:.6f} SOL")
     lines.append(f"**Jito tip revenue:** {leader_data['total_tips_sol']:.6f} SOL")
     lines.append(f"**Total revenue:** {leader_data['total_revenue_sol']:.6f} SOL")
+    # What actually reaches the validator: all fees, but only our commission of
+    # the tips, less the vote fees paid to stay in the schedule. Same arithmetic
+    # as leader-capture-monitor.sh's per-rotation report.
+    lines.append(f"**Jito to Validator:** {leader_data['tips_to_validator_sol']:.6f} SOL "
+                 f"({leader_data['commission_pct']:g}% commission)")
+    lines.append(f"**Total to Validator:** {leader_data['total_to_validator_sol']:.6f} SOL")
+    if leader_data.get("vote_cost_sol") is not None:
+        lines.append(f"**Vote cost:** {leader_data['vote_cost_sol']:.6f} SOL "
+                     f"({leader_data['vote_txns']:,} votes, charged at rotations)")
+        # Negative is normal on a quiet hour and is not an alert: the votes paid
+        # while waiting for a rotation can outrun what the rotation earned.
+        lines.append(f"**Net to Validator:** {leader_data['net_to_validator_sol']:.6f} SOL")
+    if leader_data.get("withdrawal_count", 0) > 0:
+        lines.append(
+            f"⚠️ **Tip account withdrawals:** {leader_data['withdrawal_count']} event(s), "
+            f"{leader_data['withdrawal_sol']:.6f} SOL out"
+        )
     if leader_data.get("tip_anomaly_count", 0) > 0:
         lines.append(
             f"⚠️ **Tip anomalies:** {leader_data['tip_anomaly_count']} event(s), "
@@ -505,7 +716,7 @@ def call_claude_api(api_key, errors_text, error_count, tracked_counts, bam_data=
 
 Include a BAM-specific bullet point in your summary assessing BAM health (connection stability, bundle processing, heartbeat status)."""
 
-    prompt = f"""You are analyzing error logs from a Solana testnet validator.
+    prompt = f"""You are analyzing error logs from a Solana {NETWORK} validator.
 Validator identity: {VALIDATOR_IDENTITY}
 There were {error_count} genuine errors ({len(errors_text.splitlines()) if errors_text.strip() else 0} unique patterns) in the past hour.{tracked_section}{bam_prompt_section}
 
@@ -526,7 +737,7 @@ Here are the genuine error log lines:
 
     payload = json.dumps({
         "model": CLAUDE_MODEL,
-        "max_tokens": 1024,
+        "max_tokens": 8192,  # 2026-08-28: raised - thinking tokens count against this
         "messages": [{"role": "user", "content": prompt}]
     }).encode('utf-8')
 
@@ -543,7 +754,16 @@ Here are the genuine error log lines:
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
             data = json.loads(resp.read().decode())
-            return data["content"][0]["text"]
+            # 2026-08-28: was data["content"][0]["text"]. With adaptive thinking on,
+            # content[0] is a thinking block and that raised KeyError. Take the first
+            # text block instead, and fail loudly rather than silently returning junk.
+            text = next((b.get("text") for b in data.get("content", [])
+                         if b.get("type") == "text"), None)
+            if text is None:
+                log(f"Claude API: no text block in response (stop_reason="
+                    f"{data.get('stop_reason')}, blocks="
+                    f"{[b.get('type') for b in data.get('content', [])]})")
+            return text
     except urllib.error.HTTPError as e:
         body = e.read().decode() if e.fp else ""
         log(f"Claude API error: HTTP {e.code}: {body}")
