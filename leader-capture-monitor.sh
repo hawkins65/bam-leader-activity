@@ -61,7 +61,10 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 OUTPUT_DIR="$SCRIPT_DIR/captures"
 DAILY_LEDGER="$SCRIPT_DIR/daily_totals.jsonl"
 # Day boundary: 18:15 America/Chicago. A capture's "central_day" is the
-# label of the day-window it falls into (window runs 18:15 → next 18:14).
+# label of the day-window its LAST BLOCK falls into (window runs 18:15 → next
+# 18:14). Block time, not report time: the 18:15 sweep takes everything
+# on-chain before it, so a capture reported seconds after the boundary must
+# still book to the closing day (0.239 SOL booked to the wrong day, 2026-08-31).
 DAY_ROLLOVER_HHMM="1815"
 DAY_TZ="America/Chicago"
 
@@ -594,6 +597,12 @@ print(
     #
     # Read the previous last_slot BEFORE update_daily_ledger appends this
     # rotation's row, or we would read our own.
+    # Day attribution anchor: when the last block LANDED, not when this report
+    # fires (~60-90s later). Fallback to capture_start_time, which is still on
+    # the block side of the boundary; capture_end_time is the one that lies.
+    local ledger_anchor_ts
+    ledger_anchor_ts=$(rpc_call "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getBlockTime\",\"params\":[$last_slot]}" | jq -r '.result // empty' 2>/dev/null)
+    [[ "$ledger_anchor_ts" =~ ^[0-9]+$ ]] || ledger_anchor_ts=$capture_start_time
     local prev_last_slot vote_txns=0 vote_mode="na" vote_cost_sol="0.000000"
     local net_to_validator="$total_to_validator"
     prev_last_slot=$(tail -n 1 "$DAILY_LEDGER" 2>/dev/null | jq -r '.last_slot // empty' 2>/dev/null)
@@ -604,7 +613,7 @@ print(
         # "Today net" disagree with the sweep by the length of whichever
         # rotation gap happened to straddle the boundary.
         local day_start
-        day_start=$(day_start_ts "$(central_day_label "$capture_end_time")")
+        day_start=$(day_start_ts "$(central_day_label "$ledger_anchor_ts")")
         read -r vote_txns vote_mode <<< "$(count_vote_txns "$prev_last_slot" "$last_slot" "$day_start")"
         vote_txns="${vote_txns:-0}"
         vote_mode="${vote_mode:-est}"
@@ -662,14 +671,14 @@ print(
     # Update daily ledger and append rolling subtotal (since 18:15 CT)
     local day_line day_fees day_tips day_rev day_n day_tips_to_val day_total_to_val
     local day_avg_cu day_produced day_vote_cost day_net day_votes
-    day_line=$(update_daily_ledger "$capture_end_time" \
+    day_line=$(update_daily_ledger "$ledger_anchor_ts" \
         "$total_fees_sol" "$total_tips_sol" "$total_revenue_sol" \
         "$total_slots" "$first_slot" "$last_slot" \
         "$total_compute_units" "$produced_slots" "$vote_txns")
     read -r day_fees day_tips day_rev day_n day_tips_to_val day_total_to_val \
             day_avg_cu day_produced day_vote_cost day_net day_votes <<< "$day_line"
     local day_label
-    day_label=$(central_day_label "$capture_end_time")
+    day_label=$(central_day_label "$ledger_anchor_ts")
     desc+=$'\n'"**Today (${day_label}, since 18:15 CT):** ${day_fees} fees + ${day_tips_to_val} tips (${COMMISSION_PCT}%) = ${day_total_to_val} SOL to validator across ${day_n} rotation(s)"
     local day_votes_fmt
     day_votes_fmt=$(LC_NUMERIC=en_US.UTF-8 printf "%'d" "${day_votes:-0}" 2>/dev/null || echo "${day_votes:-0}")
