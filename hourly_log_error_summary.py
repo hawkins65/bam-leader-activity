@@ -51,13 +51,13 @@ except (FileNotFoundError, OSError, subprocess.SubprocessError):
     VALIDATOR_IDENTITY = "unknown"
 LOG_DIR = Path.home() / "logs"
 # 2026-08-28: claude-sonnet-4-20250514 was retired and returned HTTP 404 on EVERY
-# run (~24x/day for at least the full log retention). claude-opus-5 is the current
-# default model. Opus 5 runs adaptive thinking ON by default, which is why
-# max_tokens was raised (thinking tokens count against it) and why the response
-# parser below no longer assumes content[0] is the text block - it is a thinking
-# block. To trade quality for cost on this route, add
-# "output_config": {"effort": "low"} to the payload.
-CLAUDE_MODEL = "claude-opus-5"
+# run (~24x/day for at least the full log retention). It then ran claude-opus-5
+# with adaptive thinking, which cost ~3x Sonnet and spent most of its output on
+# thinking for a 4-6 bullet Discord summary. 2026-09-14: claude-sonnet-5 with
+# thinking disabled - the model never sets severity or pages (both come from the
+# error count below), so this is summarisation only. The parser still takes the
+# first text block rather than content[0], in case thinking is re-enabled.
+CLAUDE_MODEL = "claude-sonnet-5"
 LARGE_FILE_THRESHOLD = 100 * 1024 * 1024  # 100MB
 VALIDATOR_LOG = LOG_DIR / "validator.log"
 CAPTURES_DIR = Path.home() / "bam-leader-activity" / "captures"
@@ -737,7 +737,8 @@ Here are the genuine error log lines:
 
     payload = json.dumps({
         "model": CLAUDE_MODEL,
-        "max_tokens": 8192,  # 2026-08-28: raised - thinking tokens count against this
+        "max_tokens": 1500,
+        "thinking": {"type": "disabled"},
         "messages": [{"role": "user", "content": prompt}]
     }).encode('utf-8')
 
