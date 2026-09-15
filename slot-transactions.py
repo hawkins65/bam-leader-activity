@@ -184,7 +184,7 @@ def get_block(rpc_url, slot):
             "encoding": "json",
             "transactionDetails": "full",
             "rewards": True,
-            "maxSupportedTransactionVersion": 0,
+            "maxSupportedTransactionVersion": 1,
         },
     ])
 
