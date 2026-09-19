@@ -169,6 +169,18 @@ TRACKED_LOW_SEVERITY = [
         "pattern": re.compile(r'Error running tip programs for transactions|consume-worker-error.*tip_programs_error'),
         "description": "Jito tip program execution failed for a transaction (DeFi swap/arb failure, not a validator issue)",
     },
+    {
+        # 2026-09-19: started 32 slots into epoch 1038, identical on AMS and ogden,
+        # one external ~2 SOL delinquent node, ~12k lines/hour. cluster_slots.rs
+        # recycles a row's pubkey_to_index_map from the previous epoch, so a node
+        # newly present in this epoch's validator_stakes passes the stake check at
+        # line 373 and then fails set_support_by_pubkey. Upstream cosmetic bug: the
+        # only effect is that node's slot support is not recorded. It flooded past
+        # MAX_ERRORS_COLLECTED and masked every other error in the summary.
+        "name": "Cluster Slots Unknown Pubkey",
+        "pattern": re.compile(r'cluster_slots\].*Unexpected pubkey'),
+        "description": "A node newly staked this epoch is missing from the recycled cluster_slots index map (agave/jito bug, other validators' gossip, no effect on this validator). Only escalate if the pubkey is THIS validator's identity.",
+    },
 ]
 
 # Solana log timestamp: [2026-02-15T00:00:06.663056547Z ...]
