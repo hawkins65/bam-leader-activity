@@ -161,8 +161,13 @@ TRACKED_LOW_SEVERITY = [
     },
     {
         "name": "Tower Restore",
-        "pattern": re.compile(r'failed tower restore'),
-        "description": "Tower file missing on restart, rebuilt from vote account (one-time per restart)",
+        # A restart logs TWO lines: "... due to failed tower restore" and
+        # `datapoint: tower_error error="Unable to restore tower ..."`. Only the
+        # first used to match, so the second surfaced as a genuine error after
+        # every restart. Under Alpenglow Votor (testnet since epoch 1043) the
+        # tower is not used at all.
+        "pattern": re.compile(r'failed tower restore|datapoint: tower_error error="Unable to restore tower'),
+        "description": "Tower file missing or stale on restart, rebuilt from vote account (one-time per restart; the tower is unused under Alpenglow Votor)",
     },
     {
         "name": "Tip Programs Transaction Error",
