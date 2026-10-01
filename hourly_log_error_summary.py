@@ -140,6 +140,16 @@ TRACKED_LOW_SEVERITY = [
         "description": "BAM refusing a validator that is not on the leader schedule - NORMAL while this host is the HA standby holding the unstaked/junk identity; clears within minutes of promotion. Only escalate if it continues while the host is staked and voting.",
     },
     {
+        # 2026-10-01 20:33: "Node is shutting down" from the ams BAM node, reconnected
+        # 43ms later, surfaced as a MEDIUM "inbound stream disruption". BAM-side
+        # restarts and "Node is unhealthy" blips are routine and free unless they
+        # land inside the 20-slot pre-leader guard, which logs "Connection blocked"
+        # -- that line is NOT matched here and stays a genuine error.
+        "name": "BAM Node Restart / Unhealthy Blip",
+        "pattern": re.compile(r'bam_connection\].*inbound stream.*"Node is (shutting down|unhealthy)"'),
+        "description": "The Jito BAM node closed the stream (server restart or self-reported unhealthy); the validator reconnects within seconds. Only escalate if 'Connection blocked' lines follow, or BAM does not reconnect.",
+    },
+    {
         "name": "Dead Slot from Other Leaders",
         "pattern": re.compile(r'datapoint: replay-stage-mark_dead_slot'),
         "description": "Other validators' bad blocks rejected during replay (normal network behavior)",
