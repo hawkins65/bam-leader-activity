@@ -57,7 +57,9 @@ LOG_DIR = Path.home() / "logs"
 # thinking disabled - the model never sets severity or pages (both come from the
 # error count below), so this is summarisation only. The parser still takes the
 # first text block rather than content[0], in case thinking is re-enabled.
-CLAUDE_MODEL = "claude-sonnet-5"
+# 2026-10-01: claude-sonnet-5-5, which 400s on thinking "disabled"; its lowest
+# setting is "between_tools" (effort high or below, no other thinking field).
+CLAUDE_MODEL = "claude-sonnet-5-5"
 LARGE_FILE_THRESHOLD = 100 * 1024 * 1024  # 100MB
 VALIDATOR_LOG = LOG_DIR / "validator.log"
 CAPTURES_DIR = Path.home() / "bam-leader-activity" / "captures"
@@ -765,7 +767,8 @@ Here are the genuine error log lines:
     payload = json.dumps({
         "model": CLAUDE_MODEL,
         "max_tokens": 1500,
-        "thinking": {"type": "disabled"},
+        "thinking": {"type": "between_tools"},
+        "output_config": {"effort": "low"},
         "messages": [{"role": "user", "content": prompt}]
     }).encode('utf-8')
 
