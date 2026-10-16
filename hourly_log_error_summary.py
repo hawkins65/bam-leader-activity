@@ -152,6 +152,17 @@ TRACKED_LOW_SEVERITY = [
         "description": "The Jito BAM node closed the stream (server restart or self-reported unhealthy); the validator reconnects within seconds. Only escalate if 'Connection blocked' lines follow, or BAM does not reconnect.",
     },
     {
+        # 2026-10-16: the HA standby logged "autoconfig failed" for all 8 block
+        # engine regions (each denied the unstaked identity, RTTs fine). It was
+        # graded HIGH on the STAKED identity set 15 minutes later. standby_only:
+        # match only lines logged before the last handover to the staked identity.
+        # Failures after the handover stay genuine.
+        "name": "Block Engine Denied While Standby",
+        "pattern": re.compile(r'block_engine_stage-proxy_error.*autoconfig failed'),
+        "standby_only": True,
+        "description": "Block engine autoconfig denied while this host was the HA standby holding the unstaked identity - NORMAL (\"not on leader schedule. ignore if hot-spare\"). Escalate only if the same failures continue after the staked handover.",
+    },
+    {
         "name": "Dead Slot from Other Leaders",
         "pattern": re.compile(r'datapoint: replay-stage-mark_dead_slot'),
         "description": "Other validators' bad blocks rejected during replay (normal network behavior)",
@@ -200,6 +211,10 @@ TRACKED_LOW_SEVERITY = [
     },
 ]
 
+# Set by main(): when this host last took the staked identity (see
+# find_last_handover). Used by entries with "standby_only".
+STANDBY_BE_CUTOFF = None
+
 # Solana log timestamp: [2026-02-15T00:00:06.663056547Z ...]
 # 2026-08-29: this used to require a literal "[" and an ISO "T" separator, which
 # only validator.log actually writes. Every other log in ~/logs uses
@@ -235,10 +250,39 @@ def parse_timestamp(line):
     return None
 
 
+def find_last_handover():
+    """Return the timestamp of the last 'Identity set to <staked>' line in validator.log.
+
+    Lines older than this were logged while this host was the HA standby. Returns
+    None when the log has no such line."""
+    if not VALIDATOR_LOG.exists():
+        return None
+    marker = f"Identity set to {VALIDATOR_IDENTITY}"
+    proc = subprocess.Popen(
+        ['tac', str(VALIDATOR_LOG)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        errors='replace'
+    )
+    try:
+        for line in proc.stdout:
+            if marker in line:
+                return parse_timestamp(line)
+    finally:
+        proc.terminate()
+        proc.wait()
+    return None
+
+
 def classify_error(line):
     """Classify an error line. Returns ('tracked', index) or ('genuine', None)."""
     for i, entry in enumerate(TRACKED_LOW_SEVERITY):
         if entry["pattern"].search(line):
+            if entry.get("standby_only"):
+                ts = parse_timestamp(line)
+                if STANDBY_BE_CUTOFF is None or ts is None or ts >= STANDBY_BE_CUTOFF:
+                    continue
             return ('tracked', i)
     return ('genuine', None)
 
@@ -846,6 +890,7 @@ def send_discord_embed(severity, title, description, footer_extra="", pagerduty=
 
 
 def main():
+    global STANDBY_BE_CUTOFF
     parser = argparse.ArgumentParser(description="Hourly AI log error summary")
     parser.add_argument("--hours", type=int, default=1, help="Hours to look back (default: 1)")
     parser.add_argument("--dry-run", action="store_true", help="Collect and analyze but don't post to Discord")
@@ -853,6 +898,9 @@ def main():
     args = parser.parse_args()
 
     log(f"Starting hourly summary (looking back {args.hours}h)...")
+    STANDBY_BE_CUTOFF = find_last_handover()
+    if args.verbose:
+        log(f"Last handover to staked identity: {STANDBY_BE_CUTOFF}")
 
     api_key = get_api_key()
     if not api_key:
